@@ -1,0 +1,83 @@
+syntax = "proto3";
+
+package websocket.v1;
+
+option go_package = "socket_server/api/proto/websocket;websocketpb";
+
+// PushMessage 表示内部推送消息。
+message PushMessage {
+  // message_id 表示消息唯一编号。
+  string message_id = 1;
+  // from_user_id 表示发送方用户编号。
+  string from_user_id = 2;
+  // biz_type 表示业务类型，例如 single、group、live、system。
+  string biz_type = 3;
+  // payload 表示序列化后的业务消息体。
+  bytes payload = 4;
+  // ack_required 表示客户端是否需要 ACK。
+  bool ack_required = 5;
+  // created_at 表示消息创建时间戳，单位秒。
+  int64 created_at = 6;
+  // to_user_ids 表示目标用户编号列表，供客户端还原单聊/群聊上下文。
+  repeated string to_user_ids = 7;
+  // conn_ids 表示本次内部推送的目标连接编号列表。
+  repeated string conn_ids = 8;
+  // group_id 表示群聊编号。
+  string group_id = 9;
+  // room_id 表示直播间编号。
+  string room_id = 10;
+}
+
+// PushToConnsRequest 表示按连接推送请求。
+message PushToConnsRequest {
+  // conn_ids 表示目标连接编号列表。
+  repeated string conn_ids = 1;
+  // message 表示待推送消息。
+  PushMessage message = 2;
+}
+
+// PushToUsersRequest 表示按用户推送请求。
+message PushToUsersRequest {
+  // user_ids 表示目标用户编号列表。
+  repeated string user_ids = 1;
+  // message 表示待推送消息。
+  PushMessage message = 2;
+}
+
+// PushResponse 表示节点推送响应。
+message PushResponse {
+  // accepted 表示节点是否接受推送任务。
+  bool accepted = 1;
+  // accepted_conn_ids 表示已写入发送队列的连接编号列表。
+  repeated string accepted_conn_ids = 2;
+  // failed_conn_ids 表示写入失败的连接编号列表。
+  repeated string failed_conn_ids = 3;
+  // reason 表示失败原因或补充说明。
+  string reason = 4;
+}
+
+// HealthRequest 表示节点健康检查请求。
+message HealthRequest {
+  // endpoint_id 表示目标节点编号。
+  string endpoint_id = 1;
+}
+
+// HealthResponse 表示节点健康检查响应。
+message HealthResponse {
+  // endpoint_id 表示目标节点编号。
+  string endpoint_id = 1;
+  // status 表示节点状态，例如 online、draining、offline。
+  string status = 2;
+  // conn_count 表示节点当前连接数量。
+  int64 conn_count = 3;
+}
+
+// WebSocketPushService 表示 WebSocket Node 内部推送服务。
+service WebSocketPushService {
+  // PushToConns 按连接编号推送消息。
+  rpc PushToConns(PushToConnsRequest) returns (PushResponse);
+  // PushToUsers 按用户编号推送消息。
+  rpc PushToUsers(PushToUsersRequest) returns (PushResponse);
+  // Health 查询节点健康状态。
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
