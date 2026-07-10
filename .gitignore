@@ -1,0 +1,16 @@
+# Local/editor state
+.DS_Store
+.idea/
+.codegraph/
+
+# Runtime/build artifacts
+runtime/
+
+# Environment-specific config
+configs/app.json
+deploy/targets.json
+deploy/runtime.env
+
+# Logs and local overrides
+*.log
+*.local

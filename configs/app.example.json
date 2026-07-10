@@ -1,0 +1,66 @@
+{
+  "storage": "redis",
+  "redis": {
+    "addr": "203.0.113.10:6379",
+    "password": "",
+    "db": 0,
+    "pool_size": 50,
+    "key_prefix": "socket:"
+  },
+  "route_token": {
+    "secret": "replace-with-production-secret",
+    "ttl_seconds": 30
+  },
+  "gateways": [
+    {
+      "endpoint_id": "gateway-1",
+      "addr": "203.0.113.11:7000",
+      "port": 7000,
+      "public_host": "ws.example.com",
+      "heartbeat_timeout_seconds": 60,
+      "last_endpoint_ttl_seconds": 600
+    }
+  ],
+  "message_apis": [
+    {
+      "endpoint_id": "message-api-1",
+      "addr": "203.0.113.21:7100",
+      "port": 7100
+    }
+  ],
+  "nodes": [
+    {
+      "endpoint_id": "ws-node-1",
+      "ws_path": "/ws/ws-node-1",
+      "ws_addr": "203.0.113.31:8081",
+      "grpc_addr": "203.0.113.31:9001",
+      "port": 8081,
+      "grpc_port": 9001,
+      "max_conn": 50000,
+      "send_buffer": 128,
+      "heartbeat_interval_seconds": 15
+    },
+    {
+      "endpoint_id": "ws-node-2",
+      "ws_path": "/ws/ws-node-2",
+      "ws_addr": "203.0.113.31:8082",
+      "grpc_addr": "203.0.113.31:9002",
+      "port": 8082,
+      "grpc_port": 9002,
+      "max_conn": 50000,
+      "send_buffer": 128,
+      "heartbeat_interval_seconds": 15
+    },
+    {
+      "endpoint_id": "ws-node-3",
+      "ws_path": "/ws/ws-node-3",
+      "ws_addr": "203.0.113.32:8081",
+      "grpc_addr": "203.0.113.32:9001",
+      "port": 8081,
+      "grpc_port": 9001,
+      "max_conn": 50000,
+      "send_buffer": 128,
+      "heartbeat_interval_seconds": 15
+    }
+  ]
+}

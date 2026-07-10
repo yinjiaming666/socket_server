@@ -1,0 +1,60 @@
+{
+  "servers": [
+    {
+      "id": "gateway-server-1",
+      "host": "203.0.113.11",
+      "ssh_user": "root",
+      "ssh_port": 22,
+      "deploy_dir": "/opt/socket-server",
+      "instances": [
+        {
+          "service": "gateway",
+          "endpoint_id": "gateway-1"
+        }
+      ]
+    },
+    {
+      "id": "message-server-1",
+      "host": "203.0.113.21",
+      "ssh_user": "root",
+      "ssh_port": 22,
+      "deploy_dir": "/opt/socket-server",
+      "instances": [
+        {
+          "service": "message-api",
+          "endpoint_id": "message-api-1"
+        }
+      ]
+    },
+    {
+      "id": "ws-server-1",
+      "host": "203.0.113.31",
+      "ssh_user": "root",
+      "ssh_port": 22,
+      "deploy_dir": "/opt/socket-server",
+      "instances": [
+        {
+          "service": "websocket-node",
+          "endpoint_id": "ws-node-1"
+        },
+        {
+          "service": "websocket-node",
+          "endpoint_id": "ws-node-2"
+        }
+      ]
+    },
+    {
+      "id": "ws-server-2",
+      "host": "203.0.113.32",
+      "ssh_user": "root",
+      "ssh_port": 22,
+      "deploy_dir": "/opt/socket-server",
+      "instances": [
+        {
+          "service": "websocket-node",
+          "endpoint_id": "ws-node-3"
+        }
+      ]
+    }
+  ]
+}
