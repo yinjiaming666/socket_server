@@ -147,13 +147,15 @@ WebSocket Node 发布前通过 `SIGUSR1` 进入 draining，默认等待 30 秒�
 ```bash
 go run ./cmd/deployctl help list
 go run ./cmd/deployctl list ws-server-1
-go run ./cmd/deployctl status ws-server-1 websocket-node ws-node-1
+go run ./cmd/deployctl list ws-server-1 websocket-node ws-node-1
 go run ./cmd/deployctl pause ws-server-1 websocket-node ws-node-1
 go run ./cmd/deployctl start ws-server-1 websocket-node ws-node-1
 go run ./cmd/deployctl logs ws-server-1 websocket-node ws-node-1
 ```
 
-`list` 的 `STATE` 中，`unit-not-found` 表示服务器上有部署记录但 systemd unit 文件不存在，通常重新部署对应实例即可修复；`systemctl-unavailable` 表示 systemctl 没有返回可识别状态，需要检查服务器 systemd 状态或权限。
+`list` 会以统一表格输出 `SERVER`、`SERVICE`、`ENDPOINT`、`HOST`、`DEPLOY_DIR`、`PORT`、`IP`、`STATUS` 和 `UPDATED_AT`。其中 WebSocket Node 的 `PORT` 为 HTTP/gRPC 端口组合，`IP` 为应用配置中的 HTTP/WS 监听地址；`status` 已合并为 `list` 的兼容别名。
+
+`STATUS` 使用 Docker 风格状态：`running`、`starting`、`restarting`、`stopping`、`stopped`、`failed`。其中 systemd 的 `activating` 会显示为 `starting`，若其子状态为 `auto-restart` 则显示为 `restarting`；`not-found` 表示有部署记录但 unit 文件不存在，`not-deployed` 表示没有部署记录，`unknown` 表示无法取得可识别的 systemd 状态。
 
 如果服务器上仍是旧版稳定脚本，可先同步 `socketctl` 和 `install-instance`，不会构建、部署或重启任何服务；旧服务器首次使用新版回滚前也应执行一次：
 
@@ -173,9 +175,8 @@ go run ./cmd/deployctl syncctl all
 自动化入口：
 
 ```text
-deploy/ci-deploy.sh              CI 平台无关入口
+deploy/ci-deploy.sh              手工或任意 CI 平台的滚动发布入口
 .github/workflows/ci.yml         自动测试
-.github/workflows/deploy.yml     Git Tag/手工生产发布
 ```
 
 生产配置和 SSH 密钥由 CI Secret 注入，不会上传包含运行配置的发布包作为流水线 Artifact。详细说明见 `deploy/QUICK_DEPLOY.md`。

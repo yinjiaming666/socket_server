@@ -24,11 +24,15 @@ Examples:
   socketctl start websocket-node ws-node-1
   socketctl logs message-api message-api-1
 
-State notes:
-  active               systemd unit is running.
-  inactive/failed      systemd knows the unit, but it is stopped or failed.
-  unit-not-found       runtime/services has a record, but the systemd unit file is missing.
-  systemctl-unavailable systemctl did not return a usable state.
+State notes (Docker-style):
+  running     service is running.
+  starting    service is starting.
+  restarting  systemd is restarting or reloading the service.
+  stopping    service is stopping.
+  stopped     service is stopped.
+  failed      service failed.
+  not-found   runtime/services has a record, but the systemd unit file is missing.
+  unknown     systemd did not return a usable state.
 
 Environment:
   DEPLOY_DIR=/opt/socket-server
@@ -62,8 +66,6 @@ COMMAND="${1:-list}"
 SERVICE="${2:-all}"
 ENDPOINT_ID="${3:-all}"
 LINES="${LINES:-100}"
-SYSTEMD_NOT_FOUND_ACTIVE_STATE="$(printf 'un%s' 'known')"
-
 if [ "$(id -u)" -eq 0 ]; then
   SUDO_CMD=""
 else
@@ -107,35 +109,29 @@ service_state() {
   unit="$1"
   load_state="$($SUDO_CMD systemctl show "$unit" --property=LoadState --value 2>/dev/null || true)"
   active_state="$($SUDO_CMD systemctl show "$unit" --property=ActiveState --value 2>/dev/null || true)"
-  case "$load_state" in
-    not-found)
-      printf "%s\n" "unit-not-found"
-      ;;
-    "")
-      if [ "$active_state" = "$SYSTEMD_NOT_FOUND_ACTIVE_STATE" ]; then
-        printf "%s\n" "unit-not-found"
-      elif [ -n "$active_state" ]; then
-        printf "%s\n" "$active_state"
-      else
-        printf "%s\n" "systemctl-unavailable"
-      fi
-      ;;
-    *)
-      if [ "$active_state" = "$SYSTEMD_NOT_FOUND_ACTIVE_STATE" ]; then
-        printf "%s\n" "unit-not-found"
-      elif [ -n "$active_state" ]; then
-        printf "%s\n" "$active_state"
-      else
-        printf "%s\n" "$load_state"
-      fi
-      ;;
+  sub_state="$($SUDO_CMD systemctl show "$unit" --property=SubState --value 2>/dev/null || true)"
+
+  if [ "$load_state" = "not-found" ]; then
+    printf "%s\n" "not-found"
+    return
+  fi
+
+  case "$active_state:$sub_state" in
+    active:*)                 printf "%s\n" "running" ;;
+    activating:auto-restart)  printf "%s\n" "restarting" ;;
+    activating:*)             printf "%s\n" "starting" ;;
+    deactivating:*)           printf "%s\n" "stopping" ;;
+    inactive:*)               printf "%s\n" "stopped" ;;
+    failed:*)                 printf "%s\n" "failed" ;;
+    reloading:*)              printf "%s\n" "restarting" ;;
+    *)                        printf "%s\n" "unknown" ;;
   esac
 }
 
 list_records() {
   matched_count=0
-  missing_unit_count=0
-  unavailable_count=0
+  not_found_count=0
+  unknown_count=0
   printf "%-16s %-24s %-48s %-24s %-24s\n" "SERVICE" "ENDPOINT" "UNIT" "UPDATED_AT" "STATE"
   while IFS= read -r file; do
     service="$(json_value service "$file")"
@@ -151,8 +147,8 @@ list_records() {
     matched_count=$((matched_count + 1))
     state="$(service_state "$unit")"
     case "$state" in
-      unit-not-found) missing_unit_count=$((missing_unit_count + 1)) ;;
-      systemctl-unavailable) unavailable_count=$((unavailable_count + 1)) ;;
+      not-found) not_found_count=$((not_found_count + 1)) ;;
+      unknown)   unknown_count=$((unknown_count + 1)) ;;
     esac
     printf "%-16s %-24s %-48s %-24s %-24s\n" "$service" "$endpoint" "$unit" "$updated_at" "$state"
   done < <(record_files)
@@ -161,11 +157,11 @@ list_records() {
     echo "[hint] no matching service records: service=$SERVICE endpoint=$ENDPOINT_ID" >&2
     return 0
   fi
-  if [ "$missing_unit_count" -gt 0 ]; then
-    echo "[hint] unit-not-found 表示 runtime/services 有记录，但 /etc/systemd/system 下的 unit 不存在；重新部署对应实例可修复。" >&2
+  if [ "$not_found_count" -gt 0 ]; then
+    echo "[hint] not-found 表示 runtime/services 有记录，但 /etc/systemd/system 下的 unit 不存在；重新部署对应实例可修复。" >&2
   fi
-  if [ "$unavailable_count" -gt 0 ]; then
-    echo "[hint] systemctl-unavailable 表示 systemctl 没有返回可识别状态；请检查 systemd 权限或服务器 systemd 状态。" >&2
+  if [ "$unknown_count" -gt 0 ]; then
+    echo "[hint] unknown 表示 systemctl 没有返回可识别状态；请检查 systemd 权限或服务器 systemd 状态。" >&2
   fi
 }
 

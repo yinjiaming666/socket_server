@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	appconfig "socket_server/internal/config"
@@ -27,7 +29,7 @@ func validSSHPort(value string) bool {
 	return err == nil && port >= 1 && port <= 65535
 }
 
-// hydrateTargetHTTPPorts 从同一份应用配置解析实例端口，避免 targets.json 重复维护。
+// hydrateTargetHTTPPorts 从同一份应用配置解析实例端口和监听地址，避免 targets.json 重复维护。
 func hydrateTargetHTTPPorts(targets []Target, configPath string) error {
 	cfg, err := appconfig.Load(configPath)
 	if err != nil {
@@ -42,24 +44,41 @@ func hydrateTargetHTTPPorts(targets []Target, configPath string) error {
 				return fmt.Errorf("gateway %s not found in app config", target.EndpointID)
 			}
 			target.HTTPPort = item.Port
+			target.ListenHost = serviceListenHost(item.Addr)
 		case "message-api":
 			item, ok := cfg.FindMessageAPI(target.EndpointID)
 			if !ok {
 				return fmt.Errorf("message api %s not found in app config", target.EndpointID)
 			}
 			target.HTTPPort = item.Port
+			target.ListenHost = serviceListenHost(item.Addr)
 		case "websocket-node":
 			item, ok := cfg.FindNode(target.EndpointID)
 			if !ok {
 				return fmt.Errorf("websocket node %s not found in app config", target.EndpointID)
 			}
 			target.HTTPPort = item.Port
+			target.GRPCPort = item.GRPCPort
+			target.ListenHost = serviceListenHost(item.WSAddr)
 		}
 		if target.HTTPPort <= 0 {
 			return fmt.Errorf("%s %s health port is invalid", target.Service, target.EndpointID)
 		}
 	}
 	return nil
+}
+
+// serviceListenHost 从 host:port 格式地址提取监听 IP/主机名；无法拆分时保留原值，方便定位错误配置。
+func serviceListenHost(address string) string {
+	address = strings.TrimSpace(address)
+	if address == "" {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(address)
+	if err == nil {
+		return host
+	}
+	return address
 }
 
 // validateCompleteRollbackSelection 要求一次回滚覆盖所选物理主机上的全部实例。

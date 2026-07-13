@@ -121,7 +121,9 @@ type Target struct {
 	DeployDir  string
 	Service    string
 	EndpointID string
-	HTTPPort   int // HTTPPort 从应用配置解析，仅用于远程健康检查。
+	HTTPPort   int    // HTTPPort 从应用配置解析，用于健康检查和列表展示。
+	GRPCPort   int    // GRPCPort 仅 WebSocket Node 使用，用于列表展示。
+	ListenHost string // ListenHost 是服务 HTTP 监听地址中的 IP/主机名，用于列表展示。
 }
 
 type Filter struct {
@@ -188,7 +190,8 @@ func Execute(ctx context.Context, cfg Config, args []string) error {
 			return err
 		}
 	}
-	if req.Command == "deploy" || req.Command == "rollback" {
+	// list/status 也读取应用配置，统一展示服务端口和监听 IP。
+	if req.Command == "deploy" || req.Command == "rollback" || req.Command == "list" {
 		if err := hydrateTargetHTTPPorts(targets, cfg.AppConfig); err != nil {
 			return err
 		}
@@ -196,9 +199,10 @@ func Execute(ctx context.Context, cfg Config, args []string) error {
 
 	groups := GroupTargets(targets)
 	deployer := NewDeployer(cfg)
-	deployer.PrintPlan(targets, groups)
 
+	// plan 仅展示本地目标，保持无网络连接和无密码提示的语义。
 	if req.Command == "plan" {
+		deployer.PrintPlan(targets, groups)
 		return nil
 	}
 
@@ -209,6 +213,18 @@ func Execute(ctx context.Context, cfg Config, args []string) error {
 			defer cancel()
 			deployer.CloseMasters(closeCtx)
 		}()
+	}
+
+	// 所有远程命令先建立 SSH 连接。密码或主机指纹提示会在任何业务输出前完成，
+	// 后续 ssh/scp 复用同一控制连接，不会把提示符插入表格、日志或远端命令输出中。
+	if err := deployer.AuthenticateGroups(ctx, groups); err != nil {
+		return err
+	}
+
+	if req.Command == "list" {
+		deployer.PrintListHeader()
+	} else {
+		deployer.PrintPlan(targets, groups)
 	}
 
 	if req.Command == "deploy" {
@@ -243,7 +259,6 @@ func Execute(ctx context.Context, cfg Config, args []string) error {
 	}
 
 	if req.Command == "list" {
-		deployer.PrintListHeader()
 		for _, group := range groups {
 			if err := deployer.ListGroup(ctx, group); err != nil {
 				return err
@@ -316,8 +331,13 @@ func ParseArgs(args []string) (Request, error) {
 		return Request{Help: true}, nil
 	}
 
+	// status 已合并到 list；保留别名，避免现有运维脚本立即失效。
+	if command == "status" {
+		command = "list"
+	}
+
 	switch command {
-	case "plan", "deploy", "rollback", "history", "syncctl", "list", "start", "pause", "stop", "restart", "status", "logs":
+	case "plan", "deploy", "rollback", "history", "syncctl", "list", "start", "pause", "stop", "restart", "logs":
 	default:
 		return Request{}, fmt.Errorf("unsupported command: %s", command)
 	}
@@ -344,83 +364,100 @@ func PrintHelp(w io.Writer, topic string) {
 	switch topic {
 	case "", "all":
 	case "plan":
-		fmt.Fprint(w, `Usage:
+		fmt.Fprint(w, `用法：
   go run ./cmd/deployctl plan [server_id|all] [service|all] [endpoint_id|all]
 
-Preview the local deployment selection. It does not connect to remote servers.
+说明：仅预览本地部署目标和远程分组，不连接服务器、不执行部署。
 `)
 		return
 	case "deploy":
-		fmt.Fprint(w, `Usage:
+		fmt.Fprint(w, `用法：
   go run ./cmd/deployctl deploy [server_id|all] [service|all] [endpoint_id|all]
   go run ./cmd/deployctl all
 
-Build one immutable Linux artifact, verify SHA256, then roll selected instances one at a time.
-If a later physical host fails, previously completed hosts are rolled back in reverse order.
+说明：构建同一份不可变 Linux 制品，校验 SHA256 后按实例滚动发布。
+若后续物理主机发布失败，已完成发布的主机会按相反顺序自动回滚。
 `)
 		return
 	case "rollback":
-		fmt.Fprint(w, `Usage:
+		fmt.Fprint(w, `用法：
   go run ./cmd/deployctl rollback [server_id|all]
 
-Switch each selected physical host from current to previous, then drain, restart, and verify every instance.
-For consistency, rollback must include all instances on each selected physical host.
+说明：将每台选中物理主机从 current 切换到 previous，并依次排空、重启和校验全部实例。
+为保证版本一致性，回滚必须覆盖该物理主机上的全部实例。
 `)
 		return
 	case "history":
-		fmt.Fprint(w, `Usage:
+		fmt.Fprint(w, `用法：
   go run ./cmd/deployctl history [server_id|all]
 
-Show the latest 50 deployment and rollback audit records from each selected physical host.
+说明：显示每台选中物理主机最近 50 条发布和回滚审计记录。
 `)
 		return
 	case "syncctl":
-		fmt.Fprint(w, `Usage:
+		fmt.Fprint(w, `用法：
   go run ./cmd/deployctl syncctl [server_id|all] [service|all] [endpoint_id|all]
 
-Update the remote socketctl and install-instance stable scripts. It does not build, deploy, restart, or pause services.
+说明：仅更新远端 socketctl 和 install-instance 稳定脚本；不会构建、部署、重启或暂停服务。
 `)
 		return
 	case "list":
-		fmt.Fprint(w, `Usage:
+		fmt.Fprint(w, `用法：
   go run ./cmd/deployctl list [server_id|all] [service|all] [endpoint_id|all]
 
-Show selected deployed service records on remote servers.
+说明：以统一表格查看选中实例的部署主机、服务端口、监听 IP、Docker 风格状态和最近更新时间。
+WebSocket Node 的 PORT 列按 HTTP/gRPC 格式显示；旧的 status 命令已合并到此命令。
 
-State notes:
-  active          systemd unit is running.
-  inactive/failed systemd knows the unit, but it is stopped or failed.
-  unit-not-found  runtime/services has a record, but the systemd unit file is missing.
-  systemctl-unavailable systemctl did not return a usable state.
+状态说明：
+  running     正在运行（systemd active）。
+  starting    正在启动（systemd activating）。
+  restarting  正在自动重启或重载。
+  stopping    正在停止（systemd deactivating）。
+  stopped     已停止（systemd inactive）。
+  failed      启动或运行失败。
+  not-found   存在部署记录，但 systemd unit 文件不存在；通常重新部署即可修复。
+  not-deployed 未找到该实例的部署记录。
+  unknown     无法从 systemd 取得可识别状态，请检查服务器 systemd 状态或权限。
 `)
 		return
-	case "start", "pause", "stop", "restart", "status", "logs":
-		fmt.Fprintf(w, `Usage:
+	case "status":
+		fmt.Fprint(w, `status 已合并到 list，当前仍作为兼容别名保留。
+
+请改用：
+  go run ./cmd/deployctl list [server_id|all] [service|all] [endpoint_id|all]
+`)
+		return
+	case "start", "pause", "stop", "restart", "logs":
+		fmt.Fprintf(w, `用法：
   go run ./cmd/deployctl %s [server_id|all] [service|all] [endpoint_id|all]
 
-Run remote socketctl for each selected instance only.
-`, topic)
+说明：仅对选中的实例执行远端 socketctl %s 操作。
+`, topic, topic)
 		return
 	default:
-		fmt.Fprintf(w, "unsupported help topic: %s\n\n", topic)
+		fmt.Fprintf(w, "不支持的帮助主题：%s\n\n", topic)
 	}
-	fmt.Fprint(w, `Usage:
-  go run ./cmd/deployctl help [command]
-  go run ./cmd/deployctl plan [server_id|all] [service|all] [endpoint_id|all]
-  go run ./cmd/deployctl deploy [server_id|all] [service|all] [endpoint_id|all]
-  go run ./cmd/deployctl all
-  go run ./cmd/deployctl rollback [server_id|all]
-  go run ./cmd/deployctl history [server_id|all]
-  go run ./cmd/deployctl syncctl [server_id|all] [service|all] [endpoint_id|all]
-  go run ./cmd/deployctl list [server_id|all] [service|all] [endpoint_id|all]
-  go run ./cmd/deployctl start [server_id|all] [service|all] [endpoint_id|all]
-  go run ./cmd/deployctl pause [server_id|all] [service|all] [endpoint_id|all]
-  go run ./cmd/deployctl stop [server_id|all] [service|all] [endpoint_id|all]
-  go run ./cmd/deployctl restart [server_id|all] [service|all] [endpoint_id|all]
-  go run ./cmd/deployctl status [server_id|all] [service|all] [endpoint_id|all]
-  go run ./cmd/deployctl logs [server_id|all] [service|all] [endpoint_id|all]
+	fmt.Fprint(w, `用法：
+  go run ./cmd/deployctl help [command]                                           查看指定命令的详细说明。
+  go run ./cmd/deployctl plan [server_id|all] [service|all] [endpoint_id|all]    仅预览部署目标，不连接服务器。
+  go run ./cmd/deployctl deploy [server_id|all] [service|all] [endpoint_id|all]  构建制品并滚动发布选中实例。
+  go run ./cmd/deployctl all                                                      等同于 deploy all，发布全部实例。
+  go run ./cmd/deployctl rollback [server_id|all]                                将选中物理主机回滚到上一版本。
+  go run ./cmd/deployctl history [server_id|all]                                 查看发布和回滚审计记录。
+  go run ./cmd/deployctl syncctl [server_id|all] [service|all] [endpoint_id|all] 同步远端 socketctl 和安装脚本。
+  go run ./cmd/deployctl list [server_id|all] [service|all] [endpoint_id|all]    查看端口、监听 IP 和服务状态。
+  go run ./cmd/deployctl start [server_id|all] [service|all] [endpoint_id|all]   启动选中服务。
+  go run ./cmd/deployctl pause [server_id|all] [service|all] [endpoint_id|all]   暂停服务（等同于 stop）。
+  go run ./cmd/deployctl stop [server_id|all] [service|all] [endpoint_id|all]    停止选中服务。
+  go run ./cmd/deployctl restart [server_id|all] [service|all] [endpoint_id|all] 重启选中服务。
+  go run ./cmd/deployctl logs [server_id|all] [service|all] [endpoint_id|all]    查看最近服务日志。
 
-Environment:
+参数说明：
+  server_id / service / endpoint_id  分别按服务器、服务类型、实例编号筛选。
+  all                                选择该层级的全部目标；省略筛选参数时默认使用 all。
+  status                             已合并到 list，当前仅保留为兼容别名。
+
+环境变量：
   TARGETS_FILE=deploy/targets.json
   APP_CONFIG=configs/app.json
   RUNTIME_ENV=deploy/runtime.env
@@ -437,7 +474,7 @@ Environment:
   SSH_CONTROL_PERSIST=10m
   SSH_CONTROL_DIR=/tmp/ss-socket
 
-Examples:
+示例：
   go run ./cmd/deployctl help list
   go run ./cmd/deployctl plan all
   RELEASE_VERSION=v2026.07.11 GIT_COMMIT=abc123 go run ./cmd/deployctl deploy all
@@ -446,9 +483,11 @@ Examples:
   go run ./cmd/deployctl syncctl all
   go run ./cmd/deployctl list ws-server-1
 
-List state notes:
-  unit-not-found means the record exists but the systemd unit is missing. Redeploy that instance.
-  systemctl-unavailable means systemctl did not return a usable state. Check systemd permissions or host state.
+状态说明：
+  running / starting / restarting / stopping / stopped / failed
+  not-found     有部署记录但 systemd unit 不存在，通常重新部署对应实例即可修复。
+  not-deployed  未找到该实例的部署记录。
+  unknown       无法从 systemd 取得可识别状态。
 `)
 }
 
@@ -593,7 +632,41 @@ func (d *Deployer) PrintPlan(targets []Target, groups []RemoteGroup) {
 }
 
 func (d *Deployer) PrintListHeader() {
-	fmt.Fprintf(d.cfg.Stdout, "%-28s %-16s %-24s %-48s %-24s %-24s\n", "SERVER", "SERVICE", "ENDPOINT", "UNIT", "UPDATED_AT", "STATE")
+	out := d.cfg.Stdout
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "Socket Server Deploy")
+	fmt.Fprintf(out, "targets: %s\n", d.cfg.TargetsFile)
+	fmt.Fprintln(out, "services:")
+	fmt.Fprintf(
+		out,
+		"%-28s %-16s %-22s %-15s %-25s %-12s %-18s %-24s %s\n",
+		"SERVER",
+		"SERVICE",
+		"ENDPOINT",
+		"HOST",
+		"DEPLOY_DIR",
+		"PORT",
+		"IP",
+		"STATUS",
+		"UPDATED_AT",
+	)
+}
+
+func targetDisplayPort(target Target) string {
+	if target.HTTPPort <= 0 {
+		return "-"
+	}
+	if target.GRPCPort > 0 {
+		return fmt.Sprintf("%d/%d", target.HTTPPort, target.GRPCPort)
+	}
+	return fmt.Sprintf("%d", target.HTTPPort)
+}
+
+func targetDisplayIP(target Target) string {
+	if host := strings.TrimSpace(target.ListenHost); host != "" {
+		return host
+	}
+	return "-"
 }
 
 func (d *Deployer) BuildPackage(ctx context.Context) error {
@@ -910,7 +983,6 @@ func (d *Deployer) ListGroup(ctx context.Context, group RemoteGroup) error {
 			continue
 		}
 		seen[key] = struct{}{}
-		d.info("list %s/%s on %s (%s)", target.Service, target.EndpointID, group.Label, group.Key.Host)
 		if err := d.ssh(ctx, group.Key, remoteListScript(target)); err != nil {
 			return err
 		}
@@ -942,12 +1014,17 @@ func (d *Deployer) ManageGroup(ctx context.Context, group RemoteGroup, command s
 }
 
 func remoteListScript(target Target) string {
-	unit := fmt.Sprintf("socket-server-%s-%s.service", target.Service, target.EndpointID)
+	unit := targetUnit(target)
+	port := targetDisplayPort(target)
+	ip := targetDisplayIP(target)
 	script := fmt.Sprintf(`
 deploy_dir=%s
 server_id=%s
 service=%s
 endpoint_id=%s
+host=%s
+port=%s
+ip=%s
 record_file="$deploy_dir/runtime/services/${service}-${endpoint_id}.json"
 unit=%s
 updated_at="-"
@@ -955,7 +1032,7 @@ updated_at="-"
 service_state() {
   unit_name="$1"
   if ! command -v systemctl >/dev/null 2>&1; then
-    printf "%%s\n" "systemctl-unavailable"
+    printf "%%s\n" "unknown"
     return
   fi
   if [ "$(id -u)" -eq 0 ]; then
@@ -963,18 +1040,25 @@ service_state() {
   else
     sudo_cmd="${SUDO_CMD:-sudo}"
   fi
-  not_found_active_state="$(printf 'un%%s' 'known')"
   load_state="$($sudo_cmd systemctl show "$unit_name" --property=LoadState --value 2>/dev/null || true)"
   active_state="$($sudo_cmd systemctl show "$unit_name" --property=ActiveState --value 2>/dev/null || true)"
-  if [ "$load_state" = "not-found" ] || [ "$active_state" = "$not_found_active_state" ]; then
-    printf "%%s\n" "unit-not-found"
-  elif [ -n "$active_state" ]; then
-    printf "%%s\n" "$active_state"
-  elif [ -n "$load_state" ]; then
-    printf "%%s\n" "$load_state"
-  else
-    printf "%%s\n" "systemctl-unavailable"
+  sub_state="$($sudo_cmd systemctl show "$unit_name" --property=SubState --value 2>/dev/null || true)"
+  if [ "$load_state" = "not-found" ]; then
+    printf "%%s\n" "not-found"
+    return
   fi
+
+  # 将 systemd 的内部状态映射为容器风格的展示状态。
+  case "$active_state:$sub_state" in
+    active:*)                 printf "%%s\n" "running" ;;
+    activating:auto-restart)  printf "%%s\n" "restarting" ;;
+    activating:*)             printf "%%s\n" "starting" ;;
+    deactivating:*)           printf "%%s\n" "stopping" ;;
+    inactive:*)               printf "%%s\n" "stopped" ;;
+    failed:*)                 printf "%%s\n" "failed" ;;
+    reloading:*)              printf "%%s\n" "restarting" ;;
+    *)                        printf "%%s\n" "unknown" ;;
+  esac
 }
 if [ -f "$record_file" ]; then
   record_unit="$(sed -n 's/^[[:space:]]*"unit"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$record_file" | head -n 1)"
@@ -983,10 +1067,10 @@ if [ -f "$record_file" ]; then
   [ -z "$record_updated_at" ] || updated_at="$record_updated_at"
   state="$(service_state "$unit")"
 else
-  state="record-not-found"
+  state="not-deployed"
 fi
-printf "%%-28s %%-16s %%-24s %%-48s %%-24s %%-24s\n" "$server_id" "$service" "$endpoint_id" "$unit" "$updated_at" "$state"
-`, shellQuote(target.DeployDir), shellQuote(target.ServerID), shellQuote(target.Service), shellQuote(target.EndpointID), shellQuote(unit))
+printf "%%-28s %%-16s %%-22s %%-15s %%-25s %%-12s %%-18s %%-24s %%s\n" "$server_id" "$service" "$endpoint_id" "$host" "$deploy_dir" "$port" "$ip" "$state" "$updated_at"
+`, shellQuote(target.DeployDir), shellQuote(target.ServerID), shellQuote(target.Service), shellQuote(target.EndpointID), shellQuote(target.Host), shellQuote(port), shellQuote(ip), shellQuote(unit))
 	return "bash -lc " + shellQuote(script)
 }
 
@@ -1008,6 +1092,24 @@ func (d *Deployer) CloseMasters(ctx context.Context) {
 		_ = d.run(ctx, Command{Name: "ssh", Args: args})
 	}
 	_ = os.RemoveAll(d.cfg.SSHControlDir)
+}
+
+// AuthenticateGroups 在输出计划、表格或远端日志前预热每台物理主机的 SSH 连接。
+//
+// SSH 复用启用时，首次 true 命令会完成密码/主机指纹交互并保留 ControlMaster，
+// 随后的 ssh 和 scp 将直接复用该连接，避免密码提示符破坏正在输出的内容。
+func (d *Deployer) AuthenticateGroups(ctx context.Context, groups []RemoteGroup) error {
+	seen := make(map[RemoteKey]struct{}, len(groups))
+	for _, group := range groups {
+		if _, ok := seen[group.Key]; ok {
+			continue
+		}
+		seen[group.Key] = struct{}{}
+		if err := d.ssh(ctx, group.Key, "true"); err != nil {
+			return fmt.Errorf("authenticate SSH for %s: %w", group.Label, err)
+		}
+	}
+	return nil
 }
 
 func (d *Deployer) ssh(ctx context.Context, key RemoteKey, remoteCmd string) error {

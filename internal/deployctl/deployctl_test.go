@@ -276,9 +276,17 @@ func TestDeployAllRunsInstallForEverySelectedInstance(t *testing.T) {
 		t.Fatalf("artifact uploads missing checksum\ncommands:\n%s", formatCommands(artifactUploads))
 	}
 
-	// 加锁必须发生在上传之前，发布链路也必须包含完整性、排空、健康和审计门禁。
-	if len(runner.commands) == 0 || runner.commands[0].Name != "ssh" || !commandsContain(runner.commands[:1], "deployment lock already held") {
-		t.Fatalf("deployment lock must be the first remote action\ncommands:\n%s", formatCommands(runner.commands))
+	// 认证预热可能先执行 ssh true；排除它后，加锁仍必须发生在上传之前。
+	firstBusinessRemote := -1
+	for i, command := range runner.commands {
+		if command.Name == "ssh" && len(command.Args) > 0 && command.Args[len(command.Args)-1] == "true" {
+			continue
+		}
+		firstBusinessRemote = i
+		break
+	}
+	if firstBusinessRemote < 0 || runner.commands[firstBusinessRemote].Name != "ssh" || !commandsContain(runner.commands[firstBusinessRemote:firstBusinessRemote+1], "deployment lock already held") {
+		t.Fatalf("deployment lock must be the first business remote action\ncommands:\n%s", formatCommands(runner.commands))
 	}
 	for _, want := range []string{
 		"sha256sum",
@@ -502,8 +510,15 @@ func TestSyncCtlUpdatesStableScriptsWithoutDeployingServices(t *testing.T) {
 func TestListUsesSelectedInstancesOnly(t *testing.T) {
 	tmp := t.TempDir()
 	targetsPath := filepath.Join(tmp, "targets.json")
+	appConfigPath := filepath.Join(tmp, "configs", "app.json")
 	controlDir := filepath.Join(tmp, "ssh")
+	if err := os.MkdirAll(filepath.Dir(appConfigPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(targetsPath, []byte(testTargetsJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(appConfigPath, []byte(testAppConfigJSON), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -512,6 +527,7 @@ func TestListUsesSelectedInstancesOnly(t *testing.T) {
 	cfg := Config{
 		RootDir:           tmp,
 		TargetsFile:       targetsPath,
+		AppConfig:         appConfigPath,
 		SSHMultiplex:      true,
 		SSHControlPersist: "10m",
 		SSHControlDir:     controlDir,
@@ -527,7 +543,7 @@ func TestListUsesSelectedInstancesOnly(t *testing.T) {
 	if len(listCommands) != 2 {
 		t.Fatalf("inline list commands = %d, want 2\ncommands:\n%s", len(listCommands), formatCommands(runner.commands))
 	}
-	for _, want := range []string{"ws-node-1", "ws-node-2"} {
+	for _, want := range []string{"ws-node-1", "ws-node-2", "8081/9001", "8082/9002", "127.0.0.1"} {
 		if !commandsContain(listCommands, want) {
 			t.Fatalf("list commands missing %s\ncommands:\n%s", want, formatCommands(listCommands))
 		}
@@ -540,34 +556,71 @@ func TestListUsesSelectedInstancesOnly(t *testing.T) {
 	if commandsContain(listCommands, "socketctl") {
 		t.Fatalf("list should not depend on remote socketctl\ncommands:\n%s", formatCommands(listCommands))
 	}
-	if !strings.Contains(stdout.String(), "STATE") {
-		t.Fatalf("list should print a local header, got:\n%s", stdout.String())
+	for _, want := range []string{"SERVER", "DEPLOY_DIR", "PORT", "IP", "STATUS", "UPDATED_AT"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("list should print the unified header containing %q, got:\n%s", want, stdout.String())
+		}
+	}
+	if strings.Contains(stdout.String(), "==> list") {
+		t.Fatalf("list rows should not be interrupted by progress lines, got:\n%s", stdout.String())
 	}
 }
 
-func TestRemoteListScriptDoesNotEmitLegacyFallbackState(t *testing.T) {
+func TestStatusIsListAlias(t *testing.T) {
+	req, err := ParseArgs([]string{"status", "ws-server-1", "websocket-node", "ws-node-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Command != "list" {
+		t.Fatalf("status command = %q, want list", req.Command)
+	}
+	if req.Filter.Server != "ws-server-1" || req.Filter.Service != "websocket-node" || req.Filter.Endpoint != "ws-node-1" {
+		t.Fatalf("status alias filters = %+v", req.Filter)
+	}
+
+	var output bytes.Buffer
+	PrintHelp(&output, "status")
+	if !strings.Contains(output.String(), "已合并到 list") {
+		t.Fatalf("status help should explain the list alias, got:\n%s", output.String())
+	}
+}
+
+func TestRemoteListScriptMapsSystemdStatesToDockerStyle(t *testing.T) {
 	script := remoteListScript(Target{
 		ServerID:   "ws-server-1",
 		DeployDir:  "/opt/socket-server",
 		Service:    "websocket-node",
 		EndpointID: "ws-node-1",
 	})
-	legacyState := "un" + "known"
-	if strings.Contains(script, legacyState) {
-		t.Fatalf("remote list script should not contain legacy fallback state:\n%s", script)
-	}
 	if strings.Contains(script, "socketctl") {
 		t.Fatalf("remote list script should not call socketctl:\n%s", script)
 	}
-	if !strings.Contains(script, "systemctl-unavailable") {
-		t.Fatalf("remote list script should expose systemctl-unavailable:\n%s", script)
+	for _, want := range []string{
+		"--property=SubState",
+		"activating:auto-restart)",
+		`"running"`,
+		`"starting"`,
+		`"restarting"`,
+		`"stopping"`,
+		`"stopped"`,
+		`"failed"`,
+		`"not-found"`,
+		`"unknown"`,
+		`state="not-deployed"`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("remote list script missing Docker-style state mapping %q:\n%s", want, script)
+		}
+	}
+	if strings.Contains(script, "unit-not-found") || strings.Contains(script, "systemctl-unavailable") {
+		t.Fatalf("remote list script should not expose raw systemd fallback labels:\n%s", script)
 	}
 	if strings.Index(script, "service_state()") > strings.Index(script, `state="$(service_state "$unit")"`) {
 		t.Fatalf("remote list script should define service_state before calling it:\n%s", script)
 	}
 }
 
-func TestHelpListExplainsUnavailableStates(t *testing.T) {
+func TestHelpListExplainsDockerStyleStates(t *testing.T) {
 	runner := &fakeRunner{}
 	var stdout bytes.Buffer
 	cfg := Config{
@@ -580,14 +633,10 @@ func TestHelpListExplainsUnavailableStates(t *testing.T) {
 		t.Fatal(err)
 	}
 	output := stdout.String()
-	for _, want := range []string{"unit-not-found", "systemctl-unavailable", "go run ./cmd/deployctl list"} {
+	for _, want := range []string{"状态说明", "Docker 风格", "HTTP/gRPC", "running", "restarting", "stopped", "not-found", "not-deployed", "unknown", "go run ./cmd/deployctl list"} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("help output missing %q:\n%s", want, output)
 		}
-	}
-	legacyState := "un" + "known"
-	if strings.Contains(output, legacyState) {
-		t.Fatalf("help output should not contain legacy fallback state:\n%s", output)
 	}
 	if len(runner.commands) != 0 {
 		t.Fatalf("help should not run commands, got:\n%s", formatCommands(runner.commands))
@@ -596,9 +645,9 @@ func TestHelpListExplainsUnavailableStates(t *testing.T) {
 
 func TestHelpDocumentsReleaseOperations(t *testing.T) {
 	for topic, wants := range map[string][]string{
-		"rollback": {"all instances", "current", "previous"},
-		"history":  {"latest 50", "audit"},
-		"":         {"RELEASE_VERSION", "DEPLOY_DRAIN_TIMEOUT_SECONDS=30", "rollback", "history"},
+		"rollback": {"全部实例", "current", "previous"},
+		"history":  {"最近 50 条", "审计"},
+		"":         {"参数说明", "RELEASE_VERSION", "DEPLOY_DRAIN_TIMEOUT_SECONDS=30", "已合并到 list"},
 	} {
 		var stdout bytes.Buffer
 		cfg := Config{RootDir: "/tmp", Runner: &fakeRunner{}, Stdout: &stdout, Stderr: io.Discard}
@@ -613,6 +662,31 @@ func TestHelpDocumentsReleaseOperations(t *testing.T) {
 			if !strings.Contains(stdout.String(), want) {
 				t.Fatalf("help %q missing %q:\n%s", topic, want, stdout.String())
 			}
+		}
+	}
+}
+
+func TestDefaultHelpExplainsEveryCommand(t *testing.T) {
+	var output bytes.Buffer
+	PrintHelp(&output, "")
+
+	for _, want := range []string{
+		"查看指定命令的详细说明。",
+		"仅预览部署目标，不连接服务器。",
+		"构建制品并滚动发布选中实例。",
+		"等同于 deploy all，发布全部实例。",
+		"将选中物理主机回滚到上一版本。",
+		"查看发布和回滚审计记录。",
+		"同步远端 socketctl 和安装脚本。",
+		"查看端口、监听 IP 和服务状态。",
+		"启动选中服务。",
+		"暂停服务（等同于 stop）。",
+		"停止选中服务。",
+		"重启选中服务。",
+		"查看最近服务日志。",
+	} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("default help missing %q:\n%s", want, output.String())
 		}
 	}
 }

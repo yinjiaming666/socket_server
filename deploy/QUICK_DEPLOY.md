@@ -252,23 +252,39 @@ go run ./cmd/deployctl list ws-server-1
 
 `list` 只会查看本地 `deploy/targets.json` 选中的实例。例如 `list ws-server-1` 只查看 `ws-server-1` 下配置的节点，不会再把同一台物理机上的其它逻辑服务一起列出。
 
-`STATE` 说明：
+输出会沿用部署计划的表格样式，并追加以下运行信息：
+
+| 列 | 说明 |
+| --- | --- |
+| `PORT` | Gateway / Message API 显示 HTTP 端口；WebSocket Node 显示 HTTP/gRPC 端口组合。 |
+| `IP` | 应用配置中的 HTTP 或 WebSocket 监听 IP/主机名。 |
+| `STATUS` | 映射后的 Docker 风格运行状态。 |
+| `UPDATED_AT` | 远端部署记录的最近更新时间。 |
+
+`STATUS` 说明：
 
 ```text
-active           systemd unit 正在运行
-inactive/failed  systemd 识别该 unit，但服务已停止或失败
-unit-not-found   runtime/services 有部署记录，但 systemd unit 文件不存在
-systemctl-unavailable systemctl 没有返回可识别状态
+running      正在运行（systemd active）
+starting     正在启动（systemd activating）
+restarting   正在自动重启或重载（activating + auto-restart / reloading）
+stopping     正在停止（systemd deactivating）
+stopped      已停止（systemd inactive）
+failed       启动或运行失败
+not-found    runtime/services 有部署记录，但 systemd unit 文件不存在
+not-deployed 未找到该实例的部署记录
+unknown      无法从 systemd 取得可识别状态
 ```
 
-看到 `unit-not-found` 时，通常重新部署对应实例即可修复。
+看到 `not-found` 时，通常重新部署对应实例即可修复。
 
-查看状态：
+查看服务列表与状态：
 
 ```bash
-go run ./cmd/deployctl status ws-server-1
-go run ./cmd/deployctl status ws-server-1 websocket-node ws-node-1
+go run ./cmd/deployctl list ws-server-1
+go run ./cmd/deployctl list ws-server-1 websocket-node ws-node-1
 ```
+
+旧的 `status` 命令已合并到 `list`，目前仅作为兼容别名保留。
 
 暂停、启动、重启：
 
@@ -326,32 +342,13 @@ bash deploy/ci-deploy.sh ws-server-1 all all
 
 它会依次执行 `go test ./...`、编译 deployctl、输出部署计划、执行滚动发布，并在成功或失败后查询远端审计记录。发布失败仍会返回非零退出码。
 
-仓库提供两份 GitHub Actions 工作流：
+仓库只保留 GitHub Actions 自动测试工作流：
 
 ```text
 .github/workflows/ci.yml       main/master 推送及 Pull Request 自动测试
-.github/workflows/deploy.yml   v* Tag 或 workflow_dispatch 生产发布
 ```
 
-在 GitHub 的 `production` Environment 中配置审批规则，并设置以下 Secrets：
-
-| Secret | 内容 |
-| --- | --- |
-| `APP_CONFIG_B64` | 生产 `configs/app.json` 的单行 Base64。 |
-| `DEPLOY_TARGETS_B64` | 生产 `deploy/targets.json` 的单行 Base64。 |
-| `RUNTIME_ENV_B64` | 可选，生产 `runtime.env` 的单行 Base64。 |
-| `SSH_PRIVATE_KEY` | 专用部署私钥原文。 |
-| `SSH_KNOWN_HOSTS` | 已人工核对指纹的目标主机 known_hosts 内容。 |
-
-macOS/Linux 可用以下方式生成单行 Base64：
-
-```bash
-base64 < configs/app.json | tr -d '\n'
-base64 < deploy/targets.json | tr -d '\n'
-base64 < deploy/runtime.env | tr -d '\n'
-```
-
-`SSH_KNOWN_HOSTS` 的主机指纹应通过云厂商控制台或其它可信渠道核对。工作流强制 `StrictHostKeyChecking=yes`，不会为了方便关闭主机身份校验。发布包包含运行配置，因此流水线不会把归档上传为 GitHub Artifact。
+生产发布可在本地直接执行，也可由任意 CI 平台调用 `deploy/ci-deploy.sh`。运行配置和 SSH 凭据应由实际使用的平台安全注入，不要提交到 Git。
 
 ## 8. 端口要求
 
