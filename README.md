@@ -56,16 +56,22 @@ Client
 直播间广播链路：
 
 ```text
-Message API
+WebSocket Node 首个本地成员加入
   ↓
-Redis Pub/Sub 或 Redis Stream
+Redis ZSET 注册 room_id → endpoint_id 短租约
   ↓
-WebSocket Node Redis 消费端
+Message API 查询房间当前承载节点
+  ↓
+Redis Pub/Sub 或 Redis Stream 通知按 endpoint_id 精准扇出
+  ↓
+目标 WebSocket Node（仅订阅自己的节点频道）
   ↓
 本节点 RoomHub
   ↓
 房间内 WebSocket 连接
 ```
+
+直播间节点租约默认 30 秒、每 10 秒续期；用户连接路由绑定同样为 30 秒，并独立每 10 秒批量续期。最后一个本地成员离开、连接断开或节点优雅停止时会立即清理；节点异常退出后，最迟约 30 秒自动排除残留绑定。
 
 ---
 
@@ -93,7 +99,7 @@ CONFIG_FILE=configs/app.json ENDPOINT_ID=ws-node-1 go run ./cmd/websocket-node
 
 ## 快速远程部署
 
-本仓库提供本地打包、上传远程服务器、安装 systemd 服务和远程管理脚本。同一台服务器可以部署多个节点，每个实例会生成独立服务名：
+本仓库提供本地/CI 打包、SHA256 校验、远程部署锁、WebSocket 排空、逐实例健康检查、自动回滚、发布历史和 systemd 管理。同一台服务器可以部署多个节点，每个实例会固定到不可变 release，并生成独立服务名：
 
 ```text
 socket-server-{service}-{endpoint_id}.service
@@ -123,8 +129,18 @@ go run ./cmd/deployctl all
 部署单台服务器：
 
 ```bash
-go run ./cmd/deployctl deploy ws-server-1
+RELEASE_VERSION=v2026.07.11 GIT_COMMIT="$(git rev-parse HEAD)" \
+  go run ./cmd/deployctl deploy ws-server-1
 ```
+
+查看发布历史或回滚整台物理主机：
+
+```bash
+go run ./cmd/deployctl history ws-server-1
+go run ./cmd/deployctl rollback ws-server-1
+```
+
+WebSocket Node 发布前通过 `SIGUSR1` 进入 draining，默认等待 30 秒。三类服务统一使用 `/readyz` 作为发布门禁并检查 Redis 等关键依赖，`/healthz` 只表示进程存活；后续主机发布失败时，已完成主机会逆序回滚。
 
 本地远程管理：
 
@@ -139,7 +155,7 @@ go run ./cmd/deployctl logs ws-server-1 websocket-node ws-node-1
 
 `list` 的 `STATE` 中，`unit-not-found` 表示服务器上有部署记录但 systemd unit 文件不存在，通常重新部署对应实例即可修复；`systemctl-unavailable` 表示 systemctl 没有返回可识别状态，需要检查服务器 systemd 状态或权限。
 
-如果服务器上已有旧版 `/opt/socket-server/socketctl`，先只同步管理脚本即可，不会构建、部署或重启任何服务：
+如果服务器上仍是旧版稳定脚本，可先同步 `socketctl` 和 `install-instance`，不会构建、部署或重启任何服务；旧服务器首次使用新版回滚前也应执行一次：
 
 ```bash
 go run ./cmd/deployctl syncctl all
@@ -154,11 +170,15 @@ go run ./cmd/deployctl syncctl all
 /opt/socket-server/socketctl pause websocket-node ws-node-1
 ```
 
-详细说明见：
+自动化入口：
 
 ```text
-deploy/QUICK_DEPLOY.md
+deploy/ci-deploy.sh              CI 平台无关入口
+.github/workflows/ci.yml         自动测试
+.github/workflows/deploy.yml     Git Tag/手工生产发布
 ```
+
+生产配置和 SSH 密钥由 CI Secret 注入，不会上传包含运行配置的发布包作为流水线 Artifact。详细说明见 `deploy/QUICK_DEPLOY.md`。
 
 ---
 
@@ -213,6 +233,43 @@ WebSocket 已包含基础生产增强：
 服务端主动 ping
 断开自动清理连接路由
 慢客户端发送队列保护
+```
+
+---
+
+## 模拟测试客户端
+
+`cmd/simulator` 可以批量获取 Gateway 路由、建立 WebSocket 连接、加入直播间，并周期发送单聊、群聊和直播消息。收到需要 ACK 的消息后会自动回 ACK，结束时输出连接数、收发量和失败数。
+
+单节点本地测试：
+
+```bash
+go run ./cmd/simulator \
+  -gateway http://127.0.0.1:7000 \
+  -message-api http://127.0.0.1:7100 \
+  -ws-base ws://127.0.0.1:8081 \
+  -users 100 \
+  -connections-per-user 2 \
+  -duration 1m
+```
+
+如果 Gateway 返回的 `ws_url` 已经可以直接访问，不需要设置 `-ws-base`。常用参数：
+
+```text
+-users                 模拟用户数
+-connections-per-user  每个用户的连接数
+-connect-concurrency   建连并发数
+-group-size            群消息成员数量
+-single-interval       单聊发送间隔，0 表示关闭
+-group-interval        群聊发送间隔，0 表示关闭
+-live-interval         直播消息发送间隔，0 表示关闭
+-verbose               输出单条失败日志
+```
+
+自动端到端测试会覆盖 Gateway 路由、WebSocket 握手、消息推送和客户端 ACK：
+
+```bash
+go test ./internal/websocket -run TestEndToEndRoutePushAndAck
 ```
 
 ---

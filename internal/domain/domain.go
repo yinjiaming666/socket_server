@@ -1,99 +1,105 @@
 package domain
 
+import "encoding/json"
+
 // Endpoint 表示一个可被 Gateway 分配的 WebSocket 节点。
 type Endpoint struct {
-	// ID 表示节点唯一编号，例如 ws-node-1。
-	ID string
-	// Status 表示节点状态，例如 online、draining、offline。
-	Status string
-	// WSPath 表示 Nginx 转发使用的 WebSocket 路径。
-	WSPath string
-	// WSAddr 表示 WebSocket Node 对外或内网监听地址。
-	WSAddr string
-	// GRPCAddr 表示 WebSocket Node 内部推送服务地址。
-	GRPCAddr string
-	// ConnCount 表示当前节点连接数量。
+	ID        string
+	Status    string
+	WSPath    string
+	WSAddr    string
+	GRPCAddr  string
 	ConnCount int64
-	// MaxConn 表示当前节点允许承载的最大连接数量。
-	MaxConn int64
-	// UpdatedAt 表示节点最近一次心跳时间戳，单位秒。
+	MaxConn   int64
 	UpdatedAt int64
 }
 
 // ConnInfo 表示一个用户长连接在系统中的路由信息。
 type ConnInfo struct {
-	// ConnID 表示连接唯一编号。
-	ConnID string
-	// UserID 表示连接所属用户编号。
-	UserID string
-	// EndpointID 表示连接所在的 WebSocket 节点编号。
+	ConnID     string
+	UserID     string
 	EndpointID string
-	// DeviceID 表示客户端设备编号。
-	DeviceID string
-	// Platform 表示客户端平台，例如 ios、android、web。
-	Platform string
-	// GRPCAddr 表示该连接所在节点的内部推送地址。
-	GRPCAddr string
-	// CreatedAt 表示连接创建时间戳，单位秒。
-	CreatedAt int64
-	// UpdatedAt 表示连接最近更新时间戳，单位秒。
-	UpdatedAt int64
+	DeviceID   string
+	Platform   string
+	GRPCAddr   string
+	CreatedAt  int64
+	UpdatedAt  int64
 }
 
-// Message 表示系统内部统一流转的消息对象。
+// Message 表示系统内部统一流转的消息对象。ConnIDs 和 DeliveryRoutes 仅用于内部路由，不得直接发送给客户端。
 type Message struct {
-	// MessageID 表示消息唯一编号。
-	MessageID string
-	// FromUserID 表示发送方用户编号。
+	MessageID  string
 	FromUserID string
-	// ToUserIDs 表示接收方用户编号列表。
-	ToUserIDs []string
-	// ConnIDs 表示本次需要推送的连接编号列表。
-	ConnIDs []string
-	// GroupID 表示群聊编号。
-	GroupID string
-	// RoomID 表示直播间编号。
-	RoomID string
-	// BizType 表示业务消息类型，例如 single、group、live_danmu、live_notice、system_to_user。
-	BizType string
-	// Payload 表示已经序列化后的业务消息体。
-	Payload []byte
-	// AckRequired 表示客户端收到消息后是否需要 ACK。
-	AckRequired bool
-	// CreatedAt 表示消息创建时间戳，单位秒。
-	CreatedAt int64
+	ToUserIDs  []string
+	ConnIDs    []string
+	// DeliveryRoutes 缓存本次投递已解析的路由，避免发送器再次访问 Redis。
+	DeliveryRoutes []*ConnInfo
+	GroupID        string
+	RoomID         string
+	BizType        string
+	Payload        []byte
+	AckRequired    bool
+	CreatedAt      int64
+}
+
+// ClientMessage 是发送给 WebSocket 客户端的公开消息结构，不包含内部连接路由。
+type ClientMessage struct {
+	MessageID   string          `json:"message_id"`
+	FromUserID  string          `json:"from_user_id,omitempty"`
+	ToUserIDs   []string        `json:"to_user_ids,omitempty"`
+	GroupID     string          `json:"group_id,omitempty"`
+	RoomID      string          `json:"room_id,omitempty"`
+	BizType     string          `json:"biz_type"`
+	Payload     json.RawMessage `json:"payload"`
+	AckRequired bool            `json:"ack_required"`
+	CreatedAt   int64           `json:"created_at"`
+}
+
+// MarshalClientMessage 将内部消息转换为客户端消息，避免暴露 ConnIDs 并避免 []byte 被 Base64 编码。
+func MarshalClientMessage(msg *Message) ([]byte, error) {
+	if msg == nil {
+		return nil, nil
+	}
+	payload := json.RawMessage(msg.Payload)
+	if !json.Valid(payload) {
+		encoded, err := json.Marshal(string(msg.Payload))
+		if err != nil {
+			return nil, err
+		}
+		payload = encoded
+	}
+	return json.Marshal(ClientMessage{
+		MessageID:   msg.MessageID,
+		FromUserID:  msg.FromUserID,
+		ToUserIDs:   msg.ToUserIDs,
+		GroupID:     msg.GroupID,
+		RoomID:      msg.RoomID,
+		BizType:     msg.BizType,
+		Payload:     payload,
+		AckRequired: msg.AckRequired,
+		CreatedAt:   msg.CreatedAt,
+	})
 }
 
 // SendResult 表示一次消息发送的聚合结果。
 type SendResult struct {
-	// Accepted 表示发送任务是否被下游发送器接受。
-	Accepted bool
-	// AcceptedConnIDs 表示已经被节点接受的连接编号列表。
+	Accepted        bool
 	AcceptedConnIDs []string
-	// FailedConnIDs 表示发送失败的连接编号列表。
-	FailedConnIDs []string
-	// Reason 表示失败原因或补充说明。
-	Reason string
+	FailedConnIDs   []string
+	Reason          string
 }
 
 // PushResponse 表示 WebSocket Node 接受推送任务后的响应。
 type PushResponse struct {
-	// Accepted 表示节点是否接受本次推送任务。
-	Accepted bool
-	// AcceptedConnIDs 表示节点已经写入本地发送队列的连接编号列表。
+	Accepted        bool
 	AcceptedConnIDs []string
-	// FailedConnIDs 表示节点无法处理的连接编号列表。
-	FailedConnIDs []string
-	// Reason 表示节点返回的失败原因或补充说明。
-	Reason string
+	FailedConnIDs   []string
+	Reason          string
 }
 
 // RouteTokenClaims 表示 Gateway 下发给客户端的临时路由凭证内容。
 type RouteTokenClaims struct {
-	// UserID 表示凭证所属用户编号。
-	UserID string
-	// EndpointID 表示凭证允许连接的节点编号。
+	UserID     string
 	EndpointID string
-	// ExpiresAt 表示凭证过期时间戳，单位秒。
-	ExpiresAt int64
+	ExpiresAt  int64
 }

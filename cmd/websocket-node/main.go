@@ -7,9 +7,11 @@ import (
 	"os/signal"
 	"strconv"
 	"syscall"
+	"time"
 
 	"socket_server/internal/config"
 	"socket_server/internal/gateway"
+	"socket_server/internal/liveroute"
 	appruntime "socket_server/internal/runtime"
 	"socket_server/internal/websocket"
 )
@@ -45,7 +47,37 @@ func main() {
 	}
 
 	node := websocket.NewNode(config, stores.EndpointRepo, stores.RouteResolver, stores.AckStore, tokenManager)
-	defer node.Stop(context.Background())
+	if appruntime.UseRedis(cfg) {
+		// Redis 模式注册直播房间节点短租约，使消息只扇出到实际承载房间的节点。
+		node.SetLiveRoomRegistry(liveroute.NewRedisRegistry(stores.Redis))
+	}
+
+	// SIGUSR1 仅能由主机进程权限触发，用于滚动发布前安全进入 draining。
+	drainSignals := make(chan os.Signal, 1)
+	signal.Notify(drainSignals, syscall.SIGUSR1)
+	defer signal.Stop(drainSignals)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-drainSignals:
+				drainCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				if err := node.BeginDrain(drainCtx); err != nil {
+					log.Printf("websocket node drain error: %v", err)
+				}
+				cancel()
+			}
+		}
+	}()
+
+	defer func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := node.Stop(stopCtx); err != nil {
+			log.Printf("websocket node stop error: %v", err)
+		}
+	}()
 
 	if err := node.Start(ctx); err != nil {
 		log.Fatal(err)
@@ -58,11 +90,15 @@ func main() {
 	}
 
 	handler := websocket.NewHandler(node)
+	// readiness 同时验证节点排空状态和 Redis 共享状态。
+	handler.SetReadinessCheck(stores.Ready)
 	mux := websocket.NewMux(handler)
 
 	addr := ":" + strconv.Itoa(nodeConfig.Port)
 	log.Printf("websocket node %s redis=%s storage=%s", config.EndpointID, cfg.Redis.Addr, cfg.Storage)
-	log.Fatal(appruntime.ServeHTTP(appruntime.HTTPServerConfig{Addr: addr, Handler: mux, Name: "websocket-node " + config.EndpointID}))
+	if err := appruntime.ServeHTTP(appruntime.HTTPServerConfig{Addr: addr, Handler: mux, Name: "websocket-node " + config.EndpointID}); err != nil {
+		log.Fatal(err)
+	}
 }
 
 // resolveNodeConfig 根据 ENDPOINT_ID 环境变量选择节点配置。

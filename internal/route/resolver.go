@@ -19,6 +19,8 @@ type Resolver interface {
 	RemoveConn(ctx context.Context, connID string) error
 	GetUserConnIDs(ctx context.Context, userID string) ([]string, error)
 	GetUsersConnIDs(ctx context.Context, userIDs []string) ([]string, error)
+	// ResolveUsers 一次解析多个用户的完整连接路由，供发送链路直接复用。
+	ResolveUsers(ctx context.Context, userIDs []string) ([]*domain.ConnInfo, error)
 	GetConnInfo(ctx context.Context, connID string) (*domain.ConnInfo, error)
 	GetConnEndpoint(ctx context.Context, connID string) (string, error)
 	GroupConnsByEndpoint(ctx context.Context, connIDs []string) (EndpointGroup, error)
@@ -123,23 +125,46 @@ func (r *MemoryResolver) GetUserConnIDs(ctx context.Context, userID string) ([]s
 
 // GetUsersConnIDs 查询多个用户的全部在线连接编号。
 func (r *MemoryResolver) GetUsersConnIDs(ctx context.Context, userIDs []string) ([]string, error) {
+	routes, err := r.ResolveUsers(ctx, userIDs)
+	if err != nil {
+		return nil, err
+	}
+	connIDs := make([]string, 0, len(routes))
+	for _, info := range routes {
+		connIDs = append(connIDs, info.ConnID)
+	}
+	return connIDs, nil
+}
+
+// ResolveUsers 在一次读锁内解析多个用户的完整连接路由。
+// 返回副本可避免发送链路意外修改解析器内部共享状态。
+func (r *MemoryResolver) ResolveUsers(ctx context.Context, userIDs []string) ([]*domain.ConnInfo, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	connMap := make(map[string]struct{})
+
+	seen := make(map[string]struct{})
+	routes := make([]*domain.ConnInfo, 0)
 	for _, userID := range userIDs {
 		for connID := range r.userConns[userID] {
-			connMap[connID] = struct{}{}
+			if _, ok := seen[connID]; ok {
+				continue
+			}
+			info, ok := r.conns[connID]
+			if !ok {
+				continue
+			}
+			seen[connID] = struct{}{}
+			copied := *info
+			routes = append(routes, &copied)
 		}
 	}
-	connIDs := make([]string, 0, len(connMap))
-	for connID := range connMap {
-		connIDs = append(connIDs, connID)
-	}
-	sort.Strings(connIDs)
-	return connIDs, nil
+	sort.Slice(routes, func(i int, j int) bool {
+		return routes[i].ConnID < routes[j].ConnID
+	})
+	return routes, nil
 }
 
 // GetConnInfo 查询指定连接的路由详情。

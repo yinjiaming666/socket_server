@@ -12,6 +12,9 @@ import (
 	"socket_server/internal/rediskey"
 )
 
+// ErrEndpointNotFound 表示节点确实不存在。
+var ErrEndpointNotFound = errors.New("endpoint not found")
+
 // RedisRepository 是基于 Redis 的 WebSocket 节点仓储。
 type RedisRepository struct {
 	// client 表示 Redis 客户端。
@@ -36,11 +39,10 @@ func (r *RedisRepository) UpsertEndpoint(ctx context.Context, ep *domain.Endpoin
 	if err != nil {
 		return err
 	}
-	if _, err := r.client.Do(ctx, "SET", r.client.Key(rediskey.EndpointKey(copied.ID)), string(body)); err != nil {
-		return err
-	}
-	_, err = r.client.Do(ctx, "SADD", r.client.Key(rediskey.EndpointsKey()), copied.ID)
-	return err
+	return r.client.Transaction(ctx,
+		[]string{"SET", r.client.Key(rediskey.EndpointKey(copied.ID)), string(body)},
+		[]string{"SADD", r.client.Key(rediskey.EndpointsKey()), copied.ID},
+	)
 }
 
 // GetEndpoint 根据节点编号获取 WebSocket 节点信息。
@@ -50,7 +52,7 @@ func (r *RedisRepository) GetEndpoint(ctx context.Context, endpointID string) (*
 		return nil, err
 	}
 	if body == "" {
-		return nil, errors.New("endpoint not found")
+		return nil, ErrEndpointNotFound
 	}
 	var ep domain.Endpoint
 	if err := json.Unmarshal([]byte(body), &ep); err != nil {
@@ -69,8 +71,14 @@ func (r *RedisRepository) ListEndpoints(ctx context.Context) ([]*domain.Endpoint
 	endpoints := make([]*domain.Endpoint, 0, len(ids))
 	for _, id := range ids {
 		ep, err := r.GetEndpoint(ctx, id)
-		if err != nil {
+		if errors.Is(err, ErrEndpointNotFound) {
+			if _, cleanupErr := r.client.Do(ctx, "SREM", r.client.Key(rediskey.EndpointsKey()), id); cleanupErr != nil {
+				return nil, cleanupErr
+			}
 			continue
+		}
+		if err != nil {
+			return nil, err
 		}
 		endpoints = append(endpoints, ep)
 	}
@@ -79,11 +87,10 @@ func (r *RedisRepository) ListEndpoints(ctx context.Context) ([]*domain.Endpoint
 
 // DeleteEndpoint 删除指定 WebSocket 节点信息。
 func (r *RedisRepository) DeleteEndpoint(ctx context.Context, endpointID string) error {
-	if _, err := r.client.Do(ctx, "DEL", r.client.Key(rediskey.EndpointKey(endpointID))); err != nil {
-		return err
-	}
-	_, err := r.client.Do(ctx, "SREM", r.client.Key(rediskey.EndpointsKey()), endpointID)
-	return err
+	return r.client.Transaction(ctx,
+		[]string{"DEL", r.client.Key(rediskey.EndpointKey(endpointID))},
+		[]string{"SREM", r.client.Key(rediskey.EndpointsKey()), endpointID},
+	)
 }
 
 // MarkDraining 将指定 WebSocket 节点标记为下线迁移状态。

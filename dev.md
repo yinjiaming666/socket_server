@@ -505,7 +505,7 @@ TTL 推荐：
 
 | Key                                | 类型              | 用途                          |
 | ---------------------------------- | --------------- | --------------------------- |
-| `live:room:{room_id}:nodes`        | Set             | 当前有哪些 WebSocket Node 承载该直播间 |
+| `live:room:{room_id}:nodes`        | Sorted Set      | 节点独立过期分数保存当前直播间承载节点      |
 | `live:node:{endpoint_id}:rooms`    | Set             | 当前节点承载了哪些直播间                |
 | `live:room:{room_id}:stats`        | Hash            | 直播间统计信息                     |
 | `live:room:{room_id}:mute_users`   | Set             | 直播间禁言用户                     |
@@ -1467,7 +1467,7 @@ func NewRedisPubSubSender(redis RedisClient) *RedisPubSubSender {
 func (s *RedisPubSubSender) Send(ctx context.Context, msg *Message) (*SendResult, error) {
     channel := LiveRoomChannel(msg.RoomID)
 
-    body, err := json.Marshal(msg)
+    body, err := domain.MarshalClientMessage(msg)
     if err != nil {
         return nil, err
     }
@@ -1527,7 +1527,7 @@ func NewRedisStreamSender(redis RedisClient) *RedisStreamSender {
 func (s *RedisStreamSender) Send(ctx context.Context, msg *Message) (*SendResult, error) {
     streamKey := LiveRoomStream(msg.RoomID)
 
-    body, err := json.Marshal(msg)
+    body, err := domain.MarshalClientMessage(msg)
     if err != nil {
         return nil, err
     }

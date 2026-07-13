@@ -42,17 +42,24 @@ func (p *MemoryPubSub) Publish(ctx context.Context, channel string, payload []by
 	}
 
 	p.mu.RLock()
-	targets := make([]chan []byte, 0, len(p.subscribers[channel]))
-	for ch := range p.subscribers[channel] {
-		targets = append(targets, ch)
-	}
-	p.mu.RUnlock()
+	defer p.mu.RUnlock()
 
-	for _, ch := range targets {
-		copied := append([]byte(nil), payload...)
+	// payload 在发布期间视为不可变，所有订阅者共享同一底层缓冲区，
+	// 避免房间广播时按订阅者数量重复分配内存。
+	for ch := range p.subscribers[channel] {
 		select {
-		case ch <- copied:
+		case ch <- payload:
 		default:
+		}
+	}
+	return nil
+}
+
+// PublishMany 将同一只读消息发布到多个内存频道。
+func (p *MemoryPubSub) PublishMany(ctx context.Context, channels []string, payload []byte) error {
+	for _, channel := range channels {
+		if err := p.Publish(ctx, channel, payload); err != nil {
+			return err
 		}
 	}
 	return nil

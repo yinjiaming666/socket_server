@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -23,5 +25,15 @@ func TestAppConfigRejectsUnsupportedStorage(t *testing.T) {
 
 	if err == nil || !strings.Contains(err.Error(), "unsupported storage mode") {
 		t.Fatalf("expected unsupported storage mode error, got %v", err)
+	}
+}
+
+func TestLoadRejectsUnknownFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.json")
+	if err := os.WriteFile(path, []byte(`{"unknown_field":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "unknown_field") {
+		t.Fatalf("expected unknown field error, got %v", err)
 	}
 }

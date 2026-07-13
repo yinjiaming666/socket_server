@@ -43,6 +43,7 @@ go build -o "$PKG_DIR/bin/message-api" ./cmd/message-api
 go build -o "$PKG_DIR/bin/websocket-node" ./cmd/websocket-node
 
 cp "$APP_CONFIG" "$PKG_DIR/configs/app.json"
+chmod 600 "$PKG_DIR/configs/app.json"
 cp "$ROOT_DIR/deploy/install-instance.sh" "$PKG_DIR/deploy/install-instance.sh"
 cp "$ROOT_DIR/deploy/socketctl.sh" "$PKG_DIR/deploy/socketctl.sh"
 chmod +x "$PKG_DIR/deploy/install-instance.sh" "$PKG_DIR/deploy/socketctl.sh"

@@ -11,6 +11,8 @@ import (
 	"socket_server/internal/sender"
 )
 
+const maxGroupMemberCount = 10000
+
 // Service 提供单聊、群聊、直播间消息的业务编排能力。
 type Service struct {
 	// store 表示消息持久化接口，当前第一版可为空实现。
@@ -26,6 +28,20 @@ type Service struct {
 // NewService 创建消息服务。
 func NewService(store Store, routeResolver route.Resolver, ackStore ack.Store, senderSelector sender.SenderSelector) *Service {
 	return &Service{store: store, routeResolver: routeResolver, ackStore: ackStore, senderSelector: senderSelector}
+}
+
+// attachDeliveryRoutes 将完整路由和连接编号同时挂到消息上，供 ACK 与发送器分别复用。
+func attachDeliveryRoutes(msg *domain.Message, routes []*domain.ConnInfo) []string {
+	connIDs := make([]string, 0, len(routes))
+	for _, info := range routes {
+		if info == nil || info.ConnID == "" {
+			continue
+		}
+		connIDs = append(connIDs, info.ConnID)
+	}
+	msg.DeliveryRoutes = routes
+	msg.ConnIDs = connIDs
+	return connIDs
 }
 
 // SendSingleMessage 发送单聊消息，并默认推送到目标用户全部在线端。
@@ -61,8 +77,11 @@ func (s *Service) SendSingleMessage(ctx context.Context, msg *domain.Message) (*
 
 // SendGroupMessage 发送中小群消息，并通过路由查询后按 endpoint 批量推送。
 func (s *Service) SendGroupMessage(ctx context.Context, msg *domain.Message, memberUserIDs []string) (*domain.SendResult, error) {
-	if msg == nil || msg.GroupID == "" {
+	if msg == nil || msg.GroupID == "" || len(memberUserIDs) == 0 {
 		return nil, errors.New("group message is incomplete")
+	}
+	if len(memberUserIDs) > maxGroupMemberCount {
+		return nil, errors.New("group member count exceeds limit")
 	}
 
 	if msg.CreatedAt == 0 {
@@ -76,11 +95,11 @@ func (s *Service) SendGroupMessage(ctx context.Context, msg *domain.Message, mem
 		return nil, err
 	}
 
-	connIDs, err := s.routeResolver.GetUsersConnIDs(ctx, memberUserIDs)
+	routes, err := s.routeResolver.ResolveUsers(ctx, memberUserIDs)
 	if err != nil {
 		return nil, err
 	}
-	msg.ConnIDs = connIDs
+	connIDs := attachDeliveryRoutes(msg, routes)
 
 	if err := s.ackStore.AddPending(ctx, msg.MessageID, connIDs); err != nil {
 		return nil, err

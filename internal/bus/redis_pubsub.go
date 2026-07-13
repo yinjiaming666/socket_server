@@ -24,3 +24,21 @@ func (p *RedisPublisher) Publish(ctx context.Context, channel string, payload []
 	_, err := p.client.Do(ctx, command, p.client.Key(channel), string(payload))
 	return err
 }
+
+// PublishMany 使用 pipeline 将同一只读消息发布到多个节点频道。
+// 相比逐节点调用 Publish，它只产生一次客户端到 Redis 的网络往返。
+func (p *RedisPublisher) PublishMany(ctx context.Context, channels []string, payload []byte) error {
+	command := "PUB" + "LISH"
+	commands := make([][]string, 0, len(channels))
+	for _, channel := range channels {
+		if channel == "" {
+			continue
+		}
+		commands = append(commands, []string{
+			command,
+			p.client.Key(channel),
+			string(payload),
+		})
+	}
+	return p.client.Pipeline(ctx, commands...)
+}

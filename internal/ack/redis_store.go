@@ -16,9 +16,14 @@ const (
 	ackStateTTL        = 24 * time.Hour
 )
 
+const addPendingScript = "local pending=KEYS[1]; local idx=KEYS[2]; local done=KEYS[3]; local failed=KEYS[4]; local score=ARGV[1]; local ttl=ARGV[2]; for i=3,#ARGV,2 do local conn=ARGV[i]; local member=ARGV[i+1]; redis.call('SADD',pending,conn); redis.call('ZADD',idx,score,member); redis.call('SREM',done,conn); redis.call('SREM',failed,conn); end; redis.call('EXPIRE',pending,ttl); redis.call('EXPIRE',done,ttl); redis.call('EXPIRE',failed,ttl); return 1"
+
+const markDoneScript = "local pending=KEYS[1]; local done=KEYS[2]; local failed=KEYS[3]; local idx=KEYS[4]; local conn=ARGV[1]; local member=ARGV[2]; local ttl=ARGV[3]; if redis.call('SISMEMBER',pending,conn)==0 then redis.call('ZREM',idx,member); return 0; end; redis.call('SREM',pending,conn); redis.call('SADD',done,conn); redis.call('SREM',failed,conn); redis.call('ZREM',idx,member); redis.call('EXPIRE',pending,ttl); redis.call('EXPIRE',done,ttl); redis.call('EXPIRE',failed,ttl); return 1"
+
+const markFailedScript = "local pending=KEYS[1]; local done=KEYS[2]; local failed=KEYS[3]; local idx=KEYS[4]; local conn=ARGV[1]; local member=ARGV[2]; local ttl=ARGV[3]; if redis.call('SISMEMBER',pending,conn)==0 then redis.call('ZREM',idx,member); return 0; end; redis.call('SREM',pending,conn); redis.call('SADD',failed,conn); redis.call('SREM',done,conn); redis.call('ZREM',idx,member); redis.call('EXPIRE',pending,ttl); redis.call('EXPIRE',done,ttl); redis.call('EXPIRE',failed,ttl); return 1"
+
 // RedisStore 是基于 Redis 的 ACK 状态存储。
 type RedisStore struct {
-	// client 表示 Redis 客户端。
 	client *redisclient.Client
 }
 
@@ -27,61 +32,56 @@ func NewRedisStore(client *redisclient.Client) *RedisStore {
 	return &RedisStore{client: client}
 }
 
-// AddPending 添加待 ACK 的连接编号。
+// AddPending 原子添加待 ACK 的连接编号和超时索引。
 func (s *RedisStore) AddPending(ctx context.Context, messageID string, connIDs []string) error {
-	if len(connIDs) == 0 {
-		return nil
+	args := []string{
+		"EVAL", addPendingScript, "4",
+		s.client.Key(rediskey.AckPendingKey(messageID)),
+		s.client.Key(ackPendingIndexKey),
+		s.client.Key(rediskey.AckDoneKey(messageID)),
+		s.client.Key(rediskey.AckFailedKey(messageID)),
+		strconv.FormatInt(time.Now().Unix(), 10),
+		strconv.Itoa(int(ackStateTTL.Seconds())),
 	}
-	args := []string{"SADD", s.client.Key(rediskey.AckPendingKey(messageID))}
-	for _, connID := range connIDs {
-		if connID != "" {
-			args = append(args, connID)
-		}
-	}
-	if len(args) <= 2 {
-		return nil
-	}
-	if _, err := s.client.Do(ctx, args...); err != nil {
-		return err
-	}
-	score := strconv.FormatInt(time.Now().Unix(), 10)
 	for _, connID := range connIDs {
 		if connID == "" {
 			continue
 		}
-		if _, err := s.client.Do(ctx, "ZADD", s.client.Key(ackPendingIndexKey), score, ackPendingIndexMember(messageID, connID)); err != nil {
-			return err
-		}
+		args = append(args, connID, ackPendingIndexMember(messageID, connID))
 	}
-	return s.expireMessageKeys(ctx, messageID)
+	if len(args) == 9 {
+		return nil
+	}
+	_, err := s.client.Do(ctx, args...)
+	return err
 }
 
-// MarkDone 将指定连接标记为已 ACK。
+// MarkDone 仅当连接仍处于 pending 时原子标记为已 ACK。
 func (s *RedisStore) MarkDone(ctx context.Context, messageID string, connID string) error {
-	if _, err := s.client.Do(ctx, "SREM", s.client.Key(rediskey.AckPendingKey(messageID)), connID); err != nil {
-		return err
-	}
-	if _, err := s.client.Do(ctx, "SADD", s.client.Key(rediskey.AckDoneKey(messageID)), connID); err != nil {
-		return err
-	}
-	if _, err := s.client.Do(ctx, "ZREM", s.client.Key(ackPendingIndexKey), ackPendingIndexMember(messageID, connID)); err != nil {
-		return err
-	}
-	return s.expireMessageKeys(ctx, messageID)
+	_, err := s.client.Do(ctx, "EVAL", markDoneScript, "4",
+		s.client.Key(rediskey.AckPendingKey(messageID)),
+		s.client.Key(rediskey.AckDoneKey(messageID)),
+		s.client.Key(rediskey.AckFailedKey(messageID)),
+		s.client.Key(ackPendingIndexKey),
+		connID,
+		ackPendingIndexMember(messageID, connID),
+		strconv.Itoa(int(ackStateTTL.Seconds())),
+	)
+	return err
 }
 
-// MarkFailed 将指定连接标记为 ACK 失败。
+// MarkFailed 仅当连接仍处于 pending 时原子标记为 ACK 失败。
 func (s *RedisStore) MarkFailed(ctx context.Context, messageID string, connID string, reason string) error {
-	if _, err := s.client.Do(ctx, "SREM", s.client.Key(rediskey.AckPendingKey(messageID)), connID); err != nil {
-		return err
-	}
-	if _, err := s.client.Do(ctx, "SADD", s.client.Key(rediskey.AckFailedKey(messageID)), connID); err != nil {
-		return err
-	}
-	if _, err := s.client.Do(ctx, "ZREM", s.client.Key(ackPendingIndexKey), ackPendingIndexMember(messageID, connID)); err != nil {
-		return err
-	}
-	return s.expireMessageKeys(ctx, messageID)
+	_, err := s.client.Do(ctx, "EVAL", markFailedScript, "4",
+		s.client.Key(rediskey.AckPendingKey(messageID)),
+		s.client.Key(rediskey.AckDoneKey(messageID)),
+		s.client.Key(rediskey.AckFailedKey(messageID)),
+		s.client.Key(ackPendingIndexKey),
+		connID,
+		ackPendingIndexMember(messageID, connID),
+		strconv.Itoa(int(ackStateTTL.Seconds())),
+	)
+	return err
 }
 
 // GetPending 查询指定消息仍未 ACK 的连接编号。
@@ -127,21 +127,6 @@ func (s *RedisStore) ListExpiredPending(ctx context.Context, before time.Time, l
 	return items, nil
 }
 
-// expireMessageKeys 为单条消息的 ACK 临时状态设置保留窗口。
-func (s *RedisStore) expireMessageKeys(ctx context.Context, messageID string) error {
-	seconds := strconv.Itoa(int(ackStateTTL.Seconds()))
-	for _, key := range []string{
-		rediskey.AckPendingKey(messageID),
-		rediskey.AckDoneKey(messageID),
-		rediskey.AckFailedKey(messageID),
-	} {
-		if _, err := s.client.Do(ctx, "EXPIRE", s.client.Key(key), seconds); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // isPending 判断索引成员对应的 pending 记录是否仍然存在。
 func (s *RedisStore) isPending(ctx context.Context, messageID string, connID string) (bool, error) {
 	value, err := s.client.String(ctx, "SISMEMBER", s.client.Key(rediskey.AckPendingKey(messageID)), connID)
@@ -151,12 +136,10 @@ func (s *RedisStore) isPending(ctx context.Context, messageID string, connID str
 	return value == "1", nil
 }
 
-// ackPendingIndexMember 返回 ACK pending 索引成员。
 func ackPendingIndexMember(messageID string, connID string) string {
 	return messageID + ackPendingIndexSep + connID
 }
 
-// splitAckPendingIndexMember 拆分 ACK pending 索引成员。
 func splitAckPendingIndexMember(value string) (string, string, bool) {
 	parts := strings.SplitN(value, ackPendingIndexSep, 2)
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {

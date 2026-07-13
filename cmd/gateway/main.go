@@ -28,12 +28,16 @@ func main() {
 	selector := gateway.NewDefaultEndpointSelector(stores.EndpointRepo, stores.RouteResolver, gatewayConfig.HeartbeatTimeout(), gatewayConfig.LastEndpointTTL())
 	tokenManager := gateway.NewRouteTokenManager(cfg.RouteToken.Secret, cfg.RouteTokenTTL())
 	handler := gateway.NewHandler(selector, tokenManager, gatewayConfig.PublicHost, int64(cfg.RouteToken.TTLSeconds))
+	// readiness 同时验证 Redis 共享状态，避免发布门禁只看到进程存活。
+	handler.SetReadinessCheck(stores.Ready)
 
 	mux := gateway.NewMux(handler)
 
 	addr := ":" + strconv.Itoa(gatewayConfig.Port)
 	log.Printf("gateway %s redis=%s storage=%s", gatewayConfig.EndpointID, cfg.Redis.Addr, cfg.Storage)
-	log.Fatal(appruntime.ServeHTTP(appruntime.HTTPServerConfig{Addr: addr, Handler: mux, Name: "gateway " + gatewayConfig.EndpointID}))
+	if err := appruntime.ServeHTTP(appruntime.HTTPServerConfig{Addr: addr, Handler: mux, Name: "gateway " + gatewayConfig.EndpointID}); err != nil {
+		log.Fatal(err)
+	}
 }
 
 // selectGatewayConfig 根据 ENDPOINT_ID 选择 Gateway 实例配置。

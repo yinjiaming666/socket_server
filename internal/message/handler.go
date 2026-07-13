@@ -1,6 +1,7 @@
 package message
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -15,11 +16,18 @@ const maxJSONBodyBytes int64 = 1 << 20
 type Handler struct {
 	// service 表示消息业务服务。
 	service *Service
+	// readinessCheck 验证 Redis 等关键依赖是否可用。
+	readinessCheck func(context.Context) error
 }
 
 // NewHandler 创建 Message API HTTP 处理器。
 func NewHandler(service *Service) *Handler {
 	return &Handler{service: service}
+}
+
+// SetReadinessCheck 设置发布和负载均衡使用的依赖就绪检查。
+func (h *Handler) SetReadinessCheck(check func(context.Context) error) {
+	h.readinessCheck = check
 }
 
 // NewMux 创建 Message API HTTP 路由。
@@ -31,10 +39,36 @@ func NewMux(handler *Handler) *http.ServeMux {
 
 // RegisterRoutes 注册 Message API 路由。
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("/healthz", h.HandleHealth)
+	mux.HandleFunc("/readyz", h.HandleReady)
 	mux.HandleFunc("/api/messages/single", h.HandleSingleMessage)
 	mux.HandleFunc("/api/messages/group", h.HandleGroupMessage)
 	mux.HandleFunc("/api/messages/ack", h.HandleClientAck)
 	mux.HandleFunc("/api/live/rooms/", h.HandleLiveRoomMessage)
+}
+
+// HandleHealth 返回 Message API 进程健康状态，供负载均衡和自动发布门禁使用。
+func (h *Handler) HandleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		httpx.WriteError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	httpx.WriteOK(w, map[string]string{"status": "ok"})
+}
+
+// HandleReady 在关键依赖可用时返回就绪状态。
+func (h *Handler) HandleReady(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		httpx.WriteError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if h.readinessCheck != nil {
+		if err := h.readinessCheck(r.Context()); err != nil {
+			httpx.WriteError(w, http.StatusServiceUnavailable, "message dependency unavailable")
+			return
+		}
+	}
+	httpx.WriteOK(w, map[string]string{"status": "ready"})
 }
 
 // SingleMessageRequest 表示单聊消息请求。
@@ -74,8 +108,10 @@ type ClientAckRequest struct {
 type AcceptedResponse struct {
 	MessageID       string   `json:"message_id"`
 	Status          string   `json:"status"`
+	Accepted        bool     `json:"accepted"`
 	AcceptedConnIDs []string `json:"accepted_conn_ids,omitempty"`
 	FailedConnIDs   []string `json:"failed_conn_ids,omitempty"`
+	Reason          string   `json:"reason,omitempty"`
 }
 
 // HandleSingleMessage 处理单聊消息发送请求。
@@ -98,7 +134,7 @@ func (h *Handler) HandleSingleMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	httpx.WriteOK(w, AcceptedResponse{MessageID: msg.MessageID, Status: "accepted", AcceptedConnIDs: result.AcceptedConnIDs, FailedConnIDs: result.FailedConnIDs})
+	httpx.WriteOK(w, acceptedResponse(msg.MessageID, result))
 }
 
 // HandleGroupMessage 处理普通群聊消息发送请求。
@@ -121,7 +157,7 @@ func (h *Handler) HandleGroupMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	httpx.WriteOK(w, AcceptedResponse{MessageID: msg.MessageID, Status: "accepted", AcceptedConnIDs: result.AcceptedConnIDs, FailedConnIDs: result.FailedConnIDs})
+	httpx.WriteOK(w, acceptedResponse(msg.MessageID, result))
 }
 
 // HandleLiveRoomMessage 处理直播间消息发送请求。
@@ -157,7 +193,7 @@ func (h *Handler) HandleLiveRoomMessage(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	httpx.WriteOK(w, AcceptedResponse{MessageID: msg.MessageID, Status: "accepted", AcceptedConnIDs: result.AcceptedConnIDs, FailedConnIDs: result.FailedConnIDs})
+	httpx.WriteOK(w, acceptedResponse(msg.MessageID, result))
 }
 
 // HandleClientAck 处理客户端 ACK 上报请求。
@@ -178,6 +214,20 @@ func (h *Handler) HandleClientAck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.WriteOK(w, map[string]string{"status": "ok"})
+}
+
+func acceptedResponse(messageID string, result *domain.SendResult) AcceptedResponse {
+	status := "accepted"
+	if !result.Accepted && len(result.AcceptedConnIDs) > 0 {
+		status = "partial"
+	} else if !result.Accepted {
+		status = "failed"
+	}
+	return AcceptedResponse{
+		MessageID: messageID, Status: status, Accepted: result.Accepted,
+		AcceptedConnIDs: result.AcceptedConnIDs, FailedConnIDs: result.FailedConnIDs,
+		Reason: result.Reason,
+	}
 }
 
 // decodeJSON 限制请求体大小并解析 JSON。

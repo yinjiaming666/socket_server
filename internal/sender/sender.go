@@ -2,7 +2,6 @@ package sender
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 
 	"socket_server/internal/domain"
@@ -21,6 +20,18 @@ type MessageSender interface {
 type PubSubClient interface {
 	// Publish 向指定频道发布消息。
 	Publish(ctx context.Context, channel string, payload []byte) error
+}
+
+// BatchPubSubClient 定义把同一消息批量发布到多个频道的可选能力。
+type BatchPubSubClient interface {
+	// PublishMany 使用一次批处理发布多个节点频道。
+	PublishMany(ctx context.Context, channels []string, payload []byte) error
+}
+
+// RoomNodeResolver 定义直播间承载节点查询能力。
+type RoomNodeResolver interface {
+	// ListRoomNodes 返回当前仍持有房间租约的节点编号。
+	ListRoomNodes(ctx context.Context, roomID string) ([]string, error)
 }
 
 // StreamClient 定义 Redis Stream 写入能力接口。
@@ -48,31 +59,92 @@ func NewGRPCSender(router route.Resolver, client push.Client) *GRPCSender {
 	return &GRPCSender{router: router, client: client}
 }
 
+// groupMessageRoutes 优先复用消息服务已经解析的完整路由，避免发送阶段再次查询 Redis。
+// 兼容仅设置 ConnIDs 的旧调用方时，才回退到 Resolver 分组。
+func groupMessageRoutes(ctx context.Context, router route.Resolver, msg *domain.Message) (route.EndpointGroup, error) {
+	if len(msg.DeliveryRoutes) == 0 {
+		if router == nil {
+			if len(msg.ConnIDs) == 0 {
+				return make(route.EndpointGroup), nil
+			}
+			return nil, errors.New("route resolver is nil")
+		}
+		return router.GroupConnsByEndpoint(ctx, msg.ConnIDs)
+	}
+
+	groups := make(route.EndpointGroup)
+	seen := make(map[string]struct{}, len(msg.DeliveryRoutes))
+	for _, info := range msg.DeliveryRoutes {
+		if info == nil {
+			continue
+		}
+		if info.ConnID == "" || info.EndpointID == "" {
+			return nil, errors.New("delivery route is incomplete")
+		}
+		if _, ok := seen[info.ConnID]; ok {
+			continue
+		}
+		seen[info.ConnID] = struct{}{}
+		groups[info.EndpointID] = append(groups[info.EndpointID], info.ConnID)
+	}
+	return groups, nil
+}
+
 // Send 按 endpoint_id 分组后批量推送连接消息。
 func (s *GRPCSender) Send(ctx context.Context, msg *domain.Message) (*domain.SendResult, error) {
 	if msg == nil {
 		return nil, errors.New("message is nil")
 	}
 
-	groups, err := s.router.GroupConnsByEndpoint(ctx, msg.ConnIDs)
+	groups, err := groupMessageRoutes(ctx, s.router, msg)
 	if err != nil {
 		return nil, err
 	}
 
-	result := &domain.SendResult{Accepted: true}
+	type outcome struct {
+		connIDs []string
+		resp    *domain.PushResponse
+		err     error
+	}
+	outcomes := make(chan outcome, len(groups))
+	sem := make(chan struct{}, 8)
 	for endpointID, connIDs := range groups {
-		resp, err := s.client.PushToConns(ctx, endpointID, connIDs, msg)
-		if err != nil {
+		endpointID := endpointID
+		connIDs := append([]string(nil), connIDs...)
+		go func() {
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				outcomes <- outcome{connIDs: connIDs, err: ctx.Err()}
+				return
+			}
+			resp, err := s.client.PushToConns(ctx, endpointID, connIDs, msg)
+			outcomes <- outcome{connIDs: connIDs, resp: resp, err: err}
+		}()
+	}
+
+	result := &domain.SendResult{Accepted: true}
+	for range groups {
+		current := <-outcomes
+		if current.err != nil {
 			result.Accepted = false
-			result.FailedConnIDs = append(result.FailedConnIDs, connIDs...)
-			result.Reason = err.Error()
+			result.FailedConnIDs = append(result.FailedConnIDs, current.connIDs...)
+			result.Reason = current.err.Error()
 			continue
 		}
-		result.AcceptedConnIDs = append(result.AcceptedConnIDs, resp.AcceptedConnIDs...)
-		result.FailedConnIDs = append(result.FailedConnIDs, resp.FailedConnIDs...)
-		if !resp.Accepted {
+		// 防御异常客户端实现返回 nil 响应，避免聚合阶段触发空指针崩溃。
+		if current.resp == nil {
 			result.Accepted = false
-			result.Reason = resp.Reason
+			result.FailedConnIDs = append(result.FailedConnIDs, current.connIDs...)
+			result.Reason = "push client returned nil response"
+			continue
+		}
+		result.AcceptedConnIDs = append(result.AcceptedConnIDs, current.resp.AcceptedConnIDs...)
+		result.FailedConnIDs = append(result.FailedConnIDs, current.resp.FailedConnIDs...)
+		if !current.resp.Accepted {
+			result.Accepted = false
+			result.Reason = current.resp.Reason
 		}
 	}
 	return result, nil
@@ -82,11 +154,18 @@ func (s *GRPCSender) Send(ctx context.Context, msg *domain.Message) (*domain.Sen
 type RedisPubSubSender struct {
 	// client 表示 Pub/Sub 发布客户端。
 	client PubSubClient
+	// roomNodes 非空时只向实际承载房间的节点频道发布。
+	roomNodes RoomNodeResolver
 }
 
-// NewRedisPubSubSender 创建 Redis Pub/Sub 发送器。
+// NewRedisPubSubSender 创建兼容全房间频道的 Pub/Sub 发送器。
 func NewRedisPubSubSender(client PubSubClient) *RedisPubSubSender {
 	return &RedisPubSubSender{client: client}
+}
+
+// NewRoutedRedisPubSubSender 创建按房间节点租约精准扇出的 Pub/Sub 发送器。
+func NewRoutedRedisPubSubSender(client PubSubClient, roomNodes RoomNodeResolver) *RedisPubSubSender {
+	return &RedisPubSubSender{client: client, roomNodes: roomNodes}
 }
 
 // Send 将消息发布到直播间 Pub/Sub 频道。
@@ -95,13 +174,38 @@ func (s *RedisPubSubSender) Send(ctx context.Context, msg *domain.Message) (*dom
 		return nil, errors.New("message is nil")
 	}
 
-	body, err := json.Marshal(msg)
+	body, err := domain.MarshalClientMessage(msg)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := s.client.Publish(ctx, rediskey.LiveRoomChannel(msg.RoomID), body); err != nil {
+	if s.roomNodes == nil {
+		if err := s.client.Publish(ctx, rediskey.LiveRoomChannel(msg.RoomID), body); err != nil {
+			return nil, err
+		}
+		return &domain.SendResult{Accepted: true}, nil
+	}
+
+	nodes, err := s.roomNodes.ListRoomNodes(ctx, msg.RoomID)
+	if err != nil {
 		return nil, err
+	}
+	channels := make([]string, 0, len(nodes))
+	for _, endpointID := range nodes {
+		channels = append(channels, rediskey.LiveNodeRoomChannel(endpointID, msg.RoomID))
+	}
+
+	// Redis 发布器支持批处理时，一次 pipeline 完成所有目标节点扇出。
+	if batchClient, ok := s.client.(BatchPubSubClient); ok {
+		if err := batchClient.PublishMany(ctx, channels, body); err != nil {
+			return nil, err
+		}
+		return &domain.SendResult{Accepted: true}, nil
+	}
+	for _, channel := range channels {
+		if err := s.client.Publish(ctx, channel, body); err != nil {
+			return nil, err
+		}
 	}
 	return &domain.SendResult{Accepted: true}, nil
 }
@@ -123,7 +227,7 @@ func (s *RedisStreamSender) Send(ctx context.Context, msg *domain.Message) (*dom
 		return nil, errors.New("message is nil")
 	}
 
-	body, err := json.Marshal(msg)
+	body, err := domain.MarshalClientMessage(msg)
 	if err != nil {
 		return nil, err
 	}

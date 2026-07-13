@@ -28,9 +28,9 @@ deploy/runtime.env     Redis 密码、route_token 密钥等运行期覆盖项
 }
 ```
 
-部署脚本会将同一份 `configs/app.json` 分发给各服务实例。
+部署脚本会将同一份 `configs/app.json` 放入权限受限的发布制品，再分发给各服务实例。生产配置应保留在本地安全目录或 CI Secret 中，不要提交到 Git。若存在 `deploy/runtime.env`，它会以 `runtime/release-env/{release_id}.env` 权限 600 保存，并固定到对应 systemd 实例；代码回滚时环境变量也会一起回到旧版本。
 
-本地部署脚本需要 `python3` 解析 `deploy/targets.json`。远程服务器不需要额外安装 JSON 解析工具。
+本地需要 Go 1.25+、OpenSSH 和 Bash。远程服务器需要 Linux、systemd、Bash、`tar`、`sha256sum`、`curl` 和 `readlink`；健康检查仅访问远端本机端口，不需要把 `/healthz` 或 `/readyz` 暴露到公网。
 
 ## 2. configs/app.json 字段说明
 
@@ -147,8 +147,21 @@ socket-server-websocket-node-ws-node-2.service
 
 ```bash
 go run ./cmd/deployctl plan all
-go run ./cmd/deployctl deploy all
+RELEASE_VERSION=v2026.07.11 GIT_COMMIT="$(git rev-parse HEAD)" \
+  go run ./cmd/deployctl deploy all
 ```
+
+不指定 `RELEASE_VERSION` 时会使用 UTC 时间和提交号生成版本。每次发布会：
+
+1. 运行本地构建，生成 `manifest.json`、归档和 SHA256。
+2. 在每台物理主机上获取原子部署锁，再上传并校验制品。
+3. 保存 `previous`，将 `current` 切到不可变 `releases/{release_id}`。
+4. WebSocket Node 先通过 `SIGUSR1` 进入 draining，默认等待 30 秒。
+5. 每次只重启一个实例，并检查 systemd 与 `/readyz`；Redis 模式还会验证 Redis 命令链路。
+6. 当前主机失败时自动恢复；后续主机失败时，已完成主机按相反顺序回滚。
+7. 写入 `runtime/deploy-history.jsonl`，并清理未被运行实例引用的旧 release。
+
+从不支持 `SIGUSR1` 的旧版本首次升级时，实例还没有 `runtime/active-releases` 标记，工具会跳过排空信号并使用 systemd 的正常 `SIGTERM` 重启；完成一次新版安装后，后续发布自动启用 30 秒 draining。
 
 快捷写法：
 
@@ -169,11 +182,15 @@ go run ./cmd/deployctl deploy all websocket-node all
 go run ./cmd/deployctl deploy all websocket-node ws-node-1
 ```
 
+systemd unit 会固定到安装当时解析出的不可变 release 路径，因此定向发布不会影响同机其它实例后续故障自启使用的版本。活动 release 会记录在 `runtime/active-releases`，历史清理不会删除仍被实例使用的目录。
+
 默认会先构建 Linux amd64 包，再上传到远程服务器。若已经构建过，可以跳过构建：
 
 ```bash
 SKIP_BUILD=1 go run ./cmd/deployctl deploy ws-server-1
 ```
+
+跳过构建时会校验 SHA256 并读取包内 `manifest.json`，自动复用原 release ID。若同时指定 `RELEASE_VERSION` 或 `GIT_COMMIT`，其值必须与 manifest 一致，否则拒绝部署。
 
 指定 SSH 参数：
 
@@ -188,6 +205,41 @@ SSH_CONTROL_PERSIST=10m go run ./cmd/deployctl deploy ws-server-1
 SSH_CONTROL_DIR=/tmp/ss-socket go run ./cmd/deployctl deploy ws-server-1
 SSH_MULTIPLEX=0 go run ./cmd/deployctl deploy ws-server-1
 ```
+
+常用发布参数：
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `RELEASE_VERSION` | UTC 时间加提交号 | 所有主机共享的不可变发布编号。 |
+| `GIT_COMMIT` | 空 | 写入制品清单的源码提交号。 |
+| `DEPLOY_HEALTH_TIMEOUT_SECONDS` | `30` | 单实例健康检查最大秒数。 |
+| `DEPLOY_DRAIN_TIMEOUT_SECONDS` | `30` | WebSocket Node 排空等待秒数。 |
+| `DEPLOY_RETAIN_RELEASES` | `5` | 每台主机至少保留的最近 release 数；运行中引用额外保留。 |
+
+查看发布历史：
+
+```bash
+go run ./cmd/deployctl history all
+go run ./cmd/deployctl history ws-server-1
+```
+
+手工回滚到 `previous`：
+
+```bash
+go run ./cmd/deployctl rollback ws-server-1
+go run ./cmd/deployctl rollback all
+```
+
+回滚会切换物理主机级 `current/previous`，因此必须覆盖该物理主机在 `targets.json` 中声明的全部实例；部分选择会在连接远端前被拒绝。
+
+若本地进程被强制终止，远端可能留下部署锁。确认没有其它发布任务运行后，先查看持有者再人工清理：
+
+```bash
+cat /opt/socket-server/runtime/deploy.lock/owner
+rm -rf /opt/socket-server/runtime/deploy.lock
+```
+
+不要在发布任务仍运行时删除锁。
 
 ## 5. 本地远程管理
 
@@ -234,18 +286,23 @@ go run ./cmd/deployctl logs ws-server-1 websocket-node ws-node-1
 
 ## 6. 服务器本地管理脚本
 
-部署时会上传并安装：
+部署时会上传并安装两个不依赖 `current` 符号链接的稳定入口：
 
 ```text
-/opt/socket-server/socketctl
+/opt/socket-server/socketctl          服务器本地管理入口
+/opt/socket-server/install-instance   deployctl 内部安装/回滚入口
 ```
 
-若服务器上还保留旧版本管理脚本，可只同步脚本，不会构建、部署、启动、暂停或重启服务：
+`install-instance` 会把 systemd unit 固定到目标不可变 release；发布切换或回滚后仍从稳定路径执行，避免误用刚切换的 `current/deploy/install-instance.sh`。
+
+若服务器上还保留旧版本稳定入口，可只同步 `socketctl` 和 `install-instance`，不会构建、部署、启动、暂停或重启服务：
 
 ```bash
 go run ./cmd/deployctl syncctl all
 go run ./cmd/deployctl syncctl ws-server-1
 ```
+
+旧服务器首次使用新版 `rollback` 前应先执行一次 `syncctl`。回滚会在切换 `current/previous` 前预检稳定安装器，缺失时直接终止并保持版本链接不变。
 
 可直接登录服务器执行：
 
@@ -258,7 +315,45 @@ go run ./cmd/deployctl syncctl ws-server-1
 /opt/socket-server/socketctl logs websocket-node ws-node-1
 ```
 
-## 7. 端口要求
+## 7. 自动化部署
+
+平台无关的 CI 入口：
+
+```bash
+bash deploy/ci-deploy.sh all all all
+bash deploy/ci-deploy.sh ws-server-1 all all
+```
+
+它会依次执行 `go test ./...`、编译 deployctl、输出部署计划、执行滚动发布，并在成功或失败后查询远端审计记录。发布失败仍会返回非零退出码。
+
+仓库提供两份 GitHub Actions 工作流：
+
+```text
+.github/workflows/ci.yml       main/master 推送及 Pull Request 自动测试
+.github/workflows/deploy.yml   v* Tag 或 workflow_dispatch 生产发布
+```
+
+在 GitHub 的 `production` Environment 中配置审批规则，并设置以下 Secrets：
+
+| Secret | 内容 |
+| --- | --- |
+| `APP_CONFIG_B64` | 生产 `configs/app.json` 的单行 Base64。 |
+| `DEPLOY_TARGETS_B64` | 生产 `deploy/targets.json` 的单行 Base64。 |
+| `RUNTIME_ENV_B64` | 可选，生产 `runtime.env` 的单行 Base64。 |
+| `SSH_PRIVATE_KEY` | 专用部署私钥原文。 |
+| `SSH_KNOWN_HOSTS` | 已人工核对指纹的目标主机 known_hosts 内容。 |
+
+macOS/Linux 可用以下方式生成单行 Base64：
+
+```bash
+base64 < configs/app.json | tr -d '\n'
+base64 < deploy/targets.json | tr -d '\n'
+base64 < deploy/runtime.env | tr -d '\n'
+```
+
+`SSH_KNOWN_HOSTS` 的主机指纹应通过云厂商控制台或其它可信渠道核对。工作流强制 `StrictHostKeyChecking=yes`，不会为了方便关闭主机身份校验。发布包包含运行配置，因此流水线不会把归档上传为 GitHub Artifact。
+
+## 8. 端口要求
 
 ```text
 Gateway HTTP       对公网或业务网开放，例如 7000

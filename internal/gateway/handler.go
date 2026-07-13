@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"net/http"
 	"strings"
 
@@ -17,6 +18,8 @@ type Handler struct {
 	publicHost string
 	// routeTokenTTLSeconds 表示 route_token 有效秒数。
 	routeTokenTTLSeconds int64
+	// readinessCheck 验证 Redis 等关键依赖是否可用。
+	readinessCheck func(context.Context) error
 }
 
 // NewHandler 创建 Go Gateway HTTP 处理器。
@@ -30,6 +33,11 @@ func NewHandler(selector EndpointSelector, tokenManager *RouteTokenManager, publ
 	return &Handler{selector: selector, tokenManager: tokenManager, publicHost: publicHost, routeTokenTTLSeconds: routeTokenTTLSeconds}
 }
 
+// SetReadinessCheck 设置发布和负载均衡使用的依赖就绪检查。
+func (h *Handler) SetReadinessCheck(check func(context.Context) error) {
+	h.readinessCheck = check
+}
+
 // NewMux 创建 Gateway HTTP 路由。
 func NewMux(handler *Handler) *http.ServeMux {
 	mux := http.NewServeMux()
@@ -39,7 +47,33 @@ func NewMux(handler *Handler) *http.ServeMux {
 
 // RegisterRoutes 注册 Gateway 路由。
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("/healthz", h.HandleHealth)
+	mux.HandleFunc("/readyz", h.HandleReady)
 	mux.HandleFunc("/api/ws/route", h.HandleRoute)
+}
+
+// HandleHealth 返回 Gateway 进程健康状态，供负载均衡和自动发布门禁使用。
+func (h *Handler) HandleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		httpx.WriteError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	httpx.WriteOK(w, map[string]string{"status": "ok"})
+}
+
+// HandleReady 在关键依赖可用时返回就绪状态。
+func (h *Handler) HandleReady(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		httpx.WriteError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if h.readinessCheck != nil {
+		if err := h.readinessCheck(r.Context()); err != nil {
+			httpx.WriteError(w, http.StatusServiceUnavailable, "gateway dependency unavailable")
+			return
+		}
+	}
+	httpx.WriteOK(w, map[string]string{"status": "ready"})
 }
 
 // RouteResponse 表示 Gateway 返回给客户端的 WebSocket 路由信息。

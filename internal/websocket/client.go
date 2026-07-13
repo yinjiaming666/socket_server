@@ -1,6 +1,11 @@
 package websocket
 
-import "sync"
+import (
+	"errors"
+	"sync"
+)
+
+const maxRoomsPerClient = 64
 
 // Client 表示 WebSocket Node 本地维护的一条客户端连接。
 type Client struct {
@@ -20,6 +25,8 @@ type Client struct {
 	rooms map[string]struct{}
 	// closed 表示连接是否已经关闭。
 	closed bool
+	// done 在连接关闭时广播，Send 不关闭以避免并发发送 panic。
+	done chan struct{}
 	// writeFunc 表示真实 WebSocket 连接的写入函数。
 	writeFunc func([]byte) error
 }
@@ -35,6 +42,7 @@ func NewClient(connID string, userID string, deviceID string, platform string, s
 		DeviceID: deviceID,
 		Platform: platform,
 		Send:     make(chan []byte, sendBuffer),
+		done:     make(chan struct{}),
 		rooms:    make(map[string]struct{}),
 	}
 }
@@ -46,20 +54,23 @@ func (c *Client) AttachWriter(writeFunc func([]byte) error) {
 	c.writeFunc = writeFunc
 }
 
-// Enqueue 将消息写入连接发送队列。
+// Enqueue 将只读消息缓冲区写入连接发送队列。
+//
+// payload 在入队后必须保持不可变。多个客户端共享同一底层字节数组，
+// 可以避免直播间广播时为每条连接复制完整消息。队列满时主动关闭慢连接。
 func (c *Client) Enqueue(payload []byte) bool {
 	c.mu.RLock()
-	closed := c.closed
-	c.mu.RUnlock()
-	if closed {
+	if c.closed {
+		c.mu.RUnlock()
 		return false
 	}
-
-	copied := append([]byte(nil), payload...)
 	select {
-	case c.Send <- copied:
+	case c.Send <- payload:
+		c.mu.RUnlock()
 		return true
 	default:
+		c.mu.RUnlock()
+		c.Close()
 		return false
 	}
 }
@@ -67,19 +78,38 @@ func (c *Client) Enqueue(payload []byte) bool {
 // WriteDirect 直接写入真实 WebSocket 连接。
 func (c *Client) WriteDirect(payload []byte) error {
 	c.mu.RLock()
+	if c.closed {
+		c.mu.RUnlock()
+		return errors.New("websocket client is closed")
+	}
 	writeFunc := c.writeFunc
 	c.mu.RUnlock()
 	if writeFunc == nil {
-		return nil
+		return errors.New("websocket writer is not attached")
 	}
 	return writeFunc(payload)
 }
 
-// JoinRoom 标记当前连接加入指定直播间。
-func (c *Client) JoinRoom(roomID string) {
+// Done 返回连接关闭通知。
+func (c *Client) Done() <-chan struct{} {
+	return c.done
+}
+
+// JoinRoom 标记当前连接加入指定直播间，并限制单连接房间数量。
+func (c *Client) JoinRoom(roomID string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed {
+		return false
+	}
+	if _, exists := c.rooms[roomID]; exists {
+		return true
+	}
+	if len(c.rooms) >= maxRoomsPerClient {
+		return false
+	}
 	c.rooms[roomID] = struct{}{}
+	return true
 }
 
 // LeaveRoom 标记当前连接离开指定直播间。
@@ -101,7 +131,7 @@ func (c *Client) Rooms() []string {
 	return rooms
 }
 
-// Close 关闭当前连接发送队列。
+// Close 关闭当前连接。Send 保持打开，消费者通过 Done 退出。
 func (c *Client) Close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -110,5 +140,5 @@ func (c *Client) Close() {
 		return
 	}
 	c.closed = true
-	close(c.Send)
+	close(c.done)
 }

@@ -99,8 +99,13 @@ func (s *MemoryStore) MarkDone(ctx context.Context, messageID string, connID str
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if _, pending := s.pending[messageID][connID]; !pending {
+		return nil
+	}
 	delete(s.pending[messageID], connID)
 	delete(s.pendingAt, pendingKey(messageID, connID))
+	delete(s.failed[messageID], connID)
+	delete(s.reasons, pendingKey(messageID, connID))
 	if _, ok := s.done[messageID]; !ok {
 		s.done[messageID] = make(map[string]struct{})
 	}
@@ -117,8 +122,12 @@ func (s *MemoryStore) MarkFailed(ctx context.Context, messageID string, connID s
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if _, pending := s.pending[messageID][connID]; !pending {
+		return nil
+	}
 	delete(s.pending[messageID], connID)
 	delete(s.pendingAt, pendingKey(messageID, connID))
+	delete(s.done[messageID], connID)
 	if _, ok := s.failed[messageID]; !ok {
 		s.failed[messageID] = make(map[string]struct{})
 	}

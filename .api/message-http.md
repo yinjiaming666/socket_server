@@ -53,9 +53,11 @@ type Response<T> = {
 
 type AcceptedResponse = {
   message_id: string;
-  status: "accepted";
+  status: "accepted" | "partial" | "failed";
+  accepted: boolean;
   accepted_conn_ids?: string[];
   failed_conn_ids?: string[];
+  reason?: string;
 }
 ```
 

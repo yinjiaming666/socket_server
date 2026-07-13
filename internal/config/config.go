@@ -1,9 +1,11 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"time"
@@ -114,7 +116,15 @@ func Load(path string) (*AppConfig, error) {
 	}
 
 	var cfg AppConfig
-	if err := json.Unmarshal(body, &cfg); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&cfg); err != nil {
+		return nil, err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return nil, errors.New("config must contain a single JSON object")
+		}
 		return nil, err
 	}
 
@@ -243,6 +253,9 @@ func (c *AppConfig) Validate() error {
 	}
 	seen := make(map[string]string)
 	for _, gateway := range c.Gateways {
+		if gateway.Port < 1 || gateway.Port > 65535 {
+			return fmt.Errorf("gateway %s port is invalid", gateway.EndpointID)
+		}
 		if gateway.EndpointID == "" {
 			return errors.New("gateway endpoint_id is empty")
 		}
@@ -254,6 +267,9 @@ func (c *AppConfig) Validate() error {
 		}
 	}
 	for _, messageAPI := range c.MessageAPIs {
+		if messageAPI.Port < 1 || messageAPI.Port > 65535 {
+			return fmt.Errorf("message_api %s port is invalid", messageAPI.EndpointID)
+		}
 		if messageAPI.EndpointID == "" {
 			return errors.New("message_api endpoint_id is empty")
 		}
@@ -265,6 +281,9 @@ func (c *AppConfig) Validate() error {
 		}
 	}
 	for _, node := range c.Nodes {
+		if node.Port < 1 || node.Port > 65535 || node.GRPCPort < 1 || node.GRPCPort > 65535 {
+			return fmt.Errorf("node %s port is invalid", node.EndpointID)
+		}
 		if node.EndpointID == "" {
 			return errors.New("node endpoint_id is empty")
 		}

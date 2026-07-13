@@ -1,7 +1,9 @@
 package websocket
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -15,11 +17,18 @@ const maxWebSocketJSONBodyBytes int64 = 1 << 20
 // Handler 提供 WebSocket Node 的 HTTP 和 WebSocket 入口。
 type Handler struct {
 	node *Node
+	// readinessCheck 验证 Redis 等关键依赖是否可用。
+	readinessCheck func(context.Context) error
 }
 
 // NewHandler 创建 WebSocket Node HTTP 处理器。
 func NewHandler(node *Node) *Handler {
 	return &Handler{node: node}
+}
+
+// SetReadinessCheck 设置发布和负载均衡使用的依赖就绪检查。
+func (h *Handler) SetReadinessCheck(check func(context.Context) error) {
+	h.readinessCheck = check
 }
 
 // NewMux 创建 WebSocket Node HTTP 路由。
@@ -31,6 +40,8 @@ func NewMux(handler *Handler) *http.ServeMux {
 
 // RegisterRoutes 注册 WebSocket Node 相关路由。
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("/healthz", h.HandleHealth)
+	mux.HandleFunc("/readyz", h.HandleReady)
 	mux.HandleFunc("/ws/", h.HandleConnect)
 	mux.HandleFunc("/api/ws-node/push-conns", h.HandlePushConns)
 	mux.HandleFunc("/api/ws-node/push-users", h.HandlePushUsers)
@@ -66,6 +77,41 @@ type StatsResponse struct {
 	ConnCount int64 `json:"conn_count"`
 }
 
+// HealthResponse 表示部署健康检查需要的节点状态。
+type HealthResponse struct {
+	Status    string `json:"status"`
+	Ready     bool   `json:"ready"`
+	ConnCount int64  `json:"conn_count"`
+}
+
+// HandleHealth 返回进程存活状态；draining 节点仍然存活，因此保持 HTTP 200。
+func (h *Handler) HandleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		httpx.WriteError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	httpx.WriteOK(w, HealthResponse{Status: "ok", Ready: h.node.Ready(), ConnCount: h.node.ConnCount()})
+}
+
+// HandleReady 返回节点能否接收新连接，部署健康门禁应使用该接口。
+func (h *Handler) HandleReady(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		httpx.WriteError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !h.node.Ready() {
+		httpx.WriteError(w, http.StatusServiceUnavailable, "node is draining")
+		return
+	}
+	if h.readinessCheck != nil {
+		if err := h.readinessCheck(r.Context()); err != nil {
+			httpx.WriteError(w, http.StatusServiceUnavailable, "websocket dependency unavailable")
+			return
+		}
+	}
+	httpx.WriteOK(w, HealthResponse{Status: "ready", Ready: true, ConnCount: h.node.ConnCount()})
+}
+
 // HandleConnect 处理真实 WebSocket Upgrade 连接注册请求。
 func (h *Handler) HandleConnect(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -93,12 +139,12 @@ func (h *Handler) HandleConnect(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) serveWebSocket(w http.ResponseWriter, r *http.Request, client *Client) {
 	conn, err := upgradeWebSocket(w, r)
 	if err != nil {
-		_ = h.node.RemoveConnection(r.Context(), client.ConnID)
+		_ = h.node.RemoveClientConnection(r.Context(), client)
 		httpx.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	defer conn.close()
-	defer h.node.RemoveConnection(r.Context(), client.ConnID)
+	defer h.node.RemoveClientConnection(r.Context(), client)
 
 	client.AttachWriter(conn.writeText)
 	done := make(chan struct{})
@@ -133,14 +179,15 @@ func (h *Handler) serveWebSocket(w http.ResponseWriter, r *http.Request, client 
 // writeLoop 写消息并定期发送服务端 ping。
 func (h *Handler) writeLoop(conn *wsConn, client *Client, done chan<- struct{}) {
 	defer close(done)
+	defer conn.close()
+	defer client.Close()
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
-		case payload, ok := <-client.Send:
-			if !ok {
-				return
-			}
+		case <-client.Done():
+			return
+		case payload := <-client.Send:
 			if err := client.WriteDirect(payload); err != nil {
 				return
 			}
@@ -168,7 +215,7 @@ func (h *Handler) handleClientMessage(r *http.Request, client *Client, payload [
 	case "ping":
 		return client.WriteDirect([]byte(`{"type":"pong"}`))
 	default:
-		return nil
+		return errors.New("unsupported client message type")
 	}
 }
 

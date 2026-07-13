@@ -1,0 +1,30 @@
+name: Go CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+
+# 测试流水线只需要读取仓库，不授予写入权限。
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test
+        run: go test ./...

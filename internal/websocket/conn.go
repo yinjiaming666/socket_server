@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 const websocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -34,12 +35,16 @@ type wsConn struct {
 
 // upgradeWebSocket 使用标准库完成 WebSocket 握手升级。
 func upgradeWebSocket(w http.ResponseWriter, r *http.Request) (*wsConn, error) {
-	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") || !headerContainsToken(r.Header.Get("Connection"), "upgrade") {
 		return nil, errors.New("not a websocket upgrade request")
 	}
+	if r.Header.Get("Sec-WebSocket-Version") != "13" {
+		return nil, errors.New("unsupported websocket version")
+	}
 	key := r.Header.Get("Sec-WebSocket-Key")
-	if key == "" {
-		return nil, errors.New("Sec-WebSocket-Key is empty")
+	decodedKey, err := base64.StdEncoding.DecodeString(key)
+	if err != nil || len(decodedKey) != 16 {
+		return nil, errors.New("invalid Sec-WebSocket-Key")
 	}
 
 	hijacker, ok := w.(http.Hijacker)
@@ -56,11 +61,25 @@ func upgradeWebSocket(w http.ResponseWriter, r *http.Request) (*wsConn, error) {
 		"Upgrade: websocket\r\n" +
 		"Connection: Upgrade\r\n" +
 		"Sec-WebSocket-Accept: " + accept + "\r\n\r\n"
-	if _, err := conn.Write([]byte(response)); err != nil {
+	if _, err := readWriter.WriteString(response); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if err := readWriter.Flush(); err != nil {
 		_ = conn.Close()
 		return nil, err
 	}
 	return &wsConn{conn: conn, reader: readWriter.Reader}, nil
+}
+
+// headerContainsToken 判断逗号分隔的 HTTP 头是否包含指定 token。
+func headerContainsToken(value string, token string) bool {
+	for _, part := range strings.Split(value, ",") {
+		if strings.EqualFold(strings.TrimSpace(part), token) {
+			return true
+		}
+	}
+	return false
 }
 
 // websocketAccept 生成 WebSocket 握手响应值。
@@ -78,9 +97,27 @@ func (c *wsConn) readMessage() ([]byte, byte, error) {
 		return nil, 0, err
 	}
 
+	fin := header[0]&0x80 != 0
+	if header[0]&0x70 != 0 {
+		return nil, 0, errors.New("websocket RSV bits are not supported")
+	}
 	opcode := header[0] & 0x0F
+	switch opcode {
+	case 0x1, 0x2, 0x8, 0x9, 0xA:
+	default:
+		return nil, 0, errors.New("unsupported websocket opcode")
+	}
+	if !fin {
+		return nil, 0, errors.New("fragmented websocket messages are not supported")
+	}
 	masked := header[1]&0x80 != 0
+	if !masked {
+		return nil, 0, errors.New("client websocket frame must be masked")
+	}
 	payloadLen := uint64(header[1] & 0x7F)
+	if opcode >= 0x8 && payloadLen >= 126 {
+		return nil, 0, errors.New("invalid websocket control frame")
+	}
 	switch payloadLen {
 	case 126:
 		ext := make([]byte, 2)
@@ -93,27 +130,35 @@ func (c *wsConn) readMessage() ([]byte, byte, error) {
 		if _, err := io.ReadFull(c.reader, ext); err != nil {
 			return nil, 0, err
 		}
+		if ext[0]&0x80 != 0 {
+			return nil, 0, errors.New("invalid websocket payload length")
+		}
 		payloadLen = binary.BigEndian.Uint64(ext)
 	}
 	if payloadLen > maxFramePayloadSize {
 		return nil, 0, errors.New("websocket frame is too large")
 	}
-
-	var maskKey [4]byte
-	if masked {
-		if _, err := io.ReadFull(c.reader, maskKey[:]); err != nil {
-			return nil, 0, err
-		}
+	if opcode >= 0x8 && payloadLen > 125 {
+		return nil, 0, errors.New("websocket control frame is too large")
 	}
 
-	payload := make([]byte, payloadLen)
+	var maskKey [4]byte
+	if _, err := io.ReadFull(c.reader, maskKey[:]); err != nil {
+		return nil, 0, err
+	}
+
+	payload := make([]byte, int(payloadLen))
 	if _, err := io.ReadFull(c.reader, payload); err != nil {
 		return nil, 0, err
 	}
-	if masked {
-		for i := range payload {
-			payload[i] ^= maskKey[i%4]
-		}
+	for i := range payload {
+		payload[i] ^= maskKey[i%4]
+	}
+	if opcode == 0x1 && !utf8.Valid(payload) {
+		return nil, 0, errors.New("invalid websocket UTF-8 payload")
+	}
+	if opcode == 0x8 && len(payload) == 1 {
+		return nil, 0, errors.New("invalid websocket close frame")
 	}
 	return payload, opcode, nil
 }
@@ -132,6 +177,9 @@ func (c *wsConn) writeClose() error { return c.writeFrame(0x8, nil) }
 
 // writeFrame 写入一个未掩码服务端帧。
 func (c *wsConn) writeFrame(opcode byte, payload []byte) error {
+	if opcode >= 0x8 && len(payload) > 125 {
+		return errors.New("websocket control frame is too large")
+	}
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 

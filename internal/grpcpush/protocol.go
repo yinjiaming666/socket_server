@@ -10,6 +10,7 @@ func MessageToProto(msg *domain.Message) *websocketpb.PushMessage {
 	if msg == nil {
 		return nil
 	}
+	// 目标连接由 PushToConnsRequest.ConnIds 单独携带，消息体不再重复传输内部路由列表。
 	return &websocketpb.PushMessage{
 		MessageId:   msg.MessageID,
 		FromUserId:  msg.FromUserID,
@@ -18,7 +19,6 @@ func MessageToProto(msg *domain.Message) *websocketpb.PushMessage {
 		AckRequired: msg.AckRequired,
 		CreatedAt:   msg.CreatedAt,
 		ToUserIds:   msg.ToUserIDs,
-		ConnIds:     msg.ConnIDs,
 		GroupId:     msg.GroupID,
 		RoomId:      msg.RoomID,
 	}

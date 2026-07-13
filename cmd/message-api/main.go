@@ -10,6 +10,7 @@ import (
 	"socket_server/internal/ack"
 	"socket_server/internal/bus"
 	"socket_server/internal/config"
+	"socket_server/internal/liveroute"
 	"socket_server/internal/message"
 	"socket_server/internal/push"
 	appruntime "socket_server/internal/runtime"
@@ -35,9 +36,13 @@ func main() {
 
 	pubSubClient := sender.PubSubClient(bus.NewMemoryPubSub())
 	streamClient := sender.StreamClient(bus.NewMemoryStream())
+	var roomNodes sender.RoomNodeResolver
 	if appruntime.UseRedis(cfg) {
+		// Message API 与 WebSocket Node 共用直播间节点租约，避免向无关节点广播。
+		liveRegistry := liveroute.NewRedisRegistry(stores.Redis)
+		roomNodes = liveRegistry
 		pubSubClient = bus.NewRedisPublisher(stores.Redis)
-		streamClient = bus.NewRedisStreamWriter(stores.Redis)
+		streamClient = bus.NewRoutedRedisStreamWriter(stores.Redis, liveRegistry)
 	}
 
 	nodeRegistry := push.NewRegistry()
@@ -49,16 +54,23 @@ func main() {
 
 	directSender := sender.NewGRPCSender(stores.RouteResolver, nodeClient)
 	roomSender := sender.NewRedisPubSubSender(pubSubClient)
+	if roomNodes != nil {
+		roomSender = sender.NewRoutedRedisPubSubSender(pubSubClient, roomNodes)
+	}
 	importantRoomSender := sender.NewRedisStreamSender(streamClient)
 	selector := sender.NewDefaultSenderSelector(directSender, roomSender, importantRoomSender, nil)
 
 	service := message.NewService(message.NewEmptyStore(), stores.RouteResolver, stores.AckStore, selector)
 	handler := message.NewHandler(service)
+	// readiness 同时验证 Redis 共享状态，避免发布门禁只看到进程存活。
+	handler.SetReadinessCheck(stores.Ready)
 	mux := message.NewMux(handler)
 
 	addr := ":" + strconv.Itoa(messageAPIConfig.Port)
 	log.Printf("message api %s redis=%s storage=%s", messageAPIConfig.EndpointID, cfg.Redis.Addr, cfg.Storage)
-	log.Fatal(appruntime.ServeHTTP(appruntime.HTTPServerConfig{Addr: addr, Handler: mux, Name: "message-api " + messageAPIConfig.EndpointID}))
+	if err := appruntime.ServeHTTP(appruntime.HTTPServerConfig{Addr: addr, Handler: mux, Name: "message-api " + messageAPIConfig.EndpointID}); err != nil {
+		log.Fatal(err)
+	}
 }
 
 // senderNodeClient 保留类型推断清晰度。

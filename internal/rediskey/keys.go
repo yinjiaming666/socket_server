@@ -57,12 +57,32 @@ func LiveRoomStream(roomID string) string {
 	return fmt.Sprintf("stream:live:room:%s", roomID)
 }
 
-// LiveRoomNodesKey 返回直播间承载节点集合 Key。
+// LiveRoomNodesKey 返回直播间承载节点租约有序集合 Key。
 func LiveRoomNodesKey(roomID string) string {
 	return fmt.Sprintf("live:room:%s:nodes", roomID)
 }
 
-// LiveNodeRoomsKey 返回节点承载直播间集合 Key。
+// LiveNodeRoomsKey 返回节点承载直播间反向索引集合 Key。
 func LiveNodeRoomsKey(endpointID string) string {
 	return fmt.Sprintf("live:node:%s:rooms", endpointID)
+}
+
+// LiveNodeRoomChannel 返回仅由指定节点消费的直播间 Pub/Sub 频道。
+func LiveNodeRoomChannel(endpointID string, roomID string) string {
+	return fmt.Sprintf("live:node:%s:room:%s", endpointID, roomID)
+}
+
+// LiveNodeRoomChannelPattern 返回指定节点的直播间 Pub/Sub 订阅模式。
+func LiveNodeRoomChannelPattern(endpointID string) string {
+	return fmt.Sprintf("live:node:%s:room:*", endpointID)
+}
+
+// LiveNodeRoomStreamChannel 返回仅由指定节点消费的重要直播消息通知频道。
+func LiveNodeRoomStreamChannel(endpointID string, roomID string) string {
+	return fmt.Sprintf("stream:live:node:%s:room:%s", endpointID, roomID)
+}
+
+// LiveNodeRoomStreamChannelPattern 返回指定节点的重要直播消息订阅模式。
+func LiveNodeRoomStreamChannelPattern(endpointID string) string {
+	return fmt.Sprintf("stream:live:node:%s:room:*", endpointID)
 }
