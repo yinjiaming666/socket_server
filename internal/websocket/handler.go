@@ -67,12 +67,6 @@ type PushRequest struct {
 	Message *domain.Message `json:"message"`
 }
 
-type ClientMessage struct {
-	Type      string `json:"type"`
-	MessageID string `json:"message_id"`
-	RoomID    string `json:"room_id"`
-}
-
 type StatsResponse struct {
 	ConnCount int64 `json:"conn_count"`
 }
@@ -165,7 +159,10 @@ func (h *Handler) serveWebSocket(w http.ResponseWriter, r *http.Request, client 
 			continue
 		case 0x1, 0x2:
 			if err := h.handleClientMessage(r, client, payload); err != nil {
-				_ = conn.writeText([]byte(`{"type":"error"}`))
+				errorPayload, marshalErr := marshalClientControl("error", clientErrorData{Message: err.Error()})
+				if marshalErr == nil {
+					_ = conn.writeText(errorPayload)
+				}
 			}
 		}
 		select {
@@ -199,23 +196,44 @@ func (h *Handler) writeLoop(conn *wsConn, client *Client, done chan<- struct{}) 
 	}
 }
 
-// handleClientMessage 处理客户端通过 WebSocket 上报的控制消息。
+// handleClientMessage 处理客户端通过 c / m / data 信封上报的控制消息。
 func (h *Handler) handleClientMessage(r *http.Request, client *Client, payload []byte) error {
-	var msg ClientMessage
-	if err := json.Unmarshal(payload, &msg); err != nil {
+	envelope, err := decodeClientEnvelope(payload)
+	if err != nil {
 		return err
 	}
-	switch msg.Type {
+
+	switch envelope.M {
 	case "ack":
-		return h.node.HandleClientAck(r.Context(), msg.MessageID, client.ConnID)
+		var data clientAckData
+		if err := decodeClientData(envelope.Data, &data); err != nil {
+			return err
+		}
+		return h.node.HandleClientAck(r.Context(), data.MessageID, client.ConnID)
 	case "join_room":
-		return h.node.JoinRoom(r.Context(), client.ConnID, msg.RoomID)
+		var data clientRoomData
+		if err := decodeClientData(envelope.Data, &data); err != nil {
+			return err
+		}
+		return h.node.JoinRoom(r.Context(), client.ConnID, data.RoomID)
 	case "leave_room":
-		return h.node.LeaveRoom(r.Context(), client.ConnID, msg.RoomID)
+		var data clientRoomData
+		if err := decodeClientData(envelope.Data, &data); err != nil {
+			return err
+		}
+		return h.node.LeaveRoom(r.Context(), client.ConnID, data.RoomID)
 	case "ping":
-		return client.WriteDirect([]byte(`{"type":"pong"}`))
+		var data struct{}
+		if err := decodeClientData(envelope.Data, &data); err != nil {
+			return err
+		}
+		response, err := marshalClientControl("pong", struct{}{})
+		if err != nil {
+			return err
+		}
+		return client.WriteDirect(response)
 	default:
-		return errors.New("unsupported client message type")
+		return errors.New("unsupported websocket method")
 	}
 }
 

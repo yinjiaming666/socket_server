@@ -23,9 +23,29 @@ type routeResponse struct {
 	} `json:"data"`
 }
 
+const (
+	socketProtocolChannel = "socket_server"
+	socketMessageMethod   = "message"
+)
+
+type socketEnvelope struct {
+	C    string          `json:"c"`
+	M    string          `json:"m"`
+	Data json.RawMessage `json:"data"`
+}
+
 type clientMessage struct {
 	MessageID   string `json:"message_id"`
 	AckRequired bool   `json:"ack_required"`
+}
+
+// socketRequest 构造模拟器发送给 WebSocket Node 的统一协议包。
+func socketRequest(method string, data any) map[string]any {
+	return map[string]any{
+		"c":    socketProtocolChannel,
+		"m":    method,
+		"data": data,
+	}
 }
 
 type simulatedConn struct {
@@ -88,7 +108,7 @@ func (s *simulator) connectOne(ctx context.Context, user string, index int) erro
 		return err
 	}
 	conn := &simulatedConn{userID: user, connID: connID, ws: ws}
-	if err := conn.sendJSON(map[string]string{"type": "join_room", "room_id": s.options.roomID}); err != nil {
+	if err := conn.sendJSON(socketRequest("join_room", map[string]string{"room_id": s.options.roomID})); err != nil {
 		_ = ws.Close()
 		return err
 	}
@@ -168,13 +188,22 @@ func (s *simulator) readLoop(conn *simulatedConn) {
 			return
 		}
 		s.stats.received.Add(1)
-		var message clientMessage
-		if err := json.Unmarshal([]byte(raw), &message); err != nil {
+		var envelope socketEnvelope
+		if err := json.Unmarshal([]byte(raw), &envelope); err != nil {
 			s.logError("decode conn=%s: %v", conn.connID, err)
 			continue
 		}
+		if envelope.C != socketProtocolChannel || envelope.M != socketMessageMethod {
+			continue
+		}
+
+		var message clientMessage
+		if err := json.Unmarshal(envelope.Data, &message); err != nil {
+			s.logError("decode message data conn=%s: %v", conn.connID, err)
+			continue
+		}
 		if message.AckRequired && message.MessageID != "" {
-			if err := conn.sendJSON(map[string]string{"type": "ack", "message_id": message.MessageID}); err != nil {
+			if err := conn.sendJSON(socketRequest("ack", map[string]string{"message_id": message.MessageID})); err != nil {
 				s.logError("ack conn=%s message=%s: %v", conn.connID, message.MessageID, err)
 				continue
 			}

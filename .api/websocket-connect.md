@@ -24,6 +24,30 @@ type Query = {
 ## 成功响应
 WebSocket 握手成功后返回 `101 Switching Protocols`。普通 HTTP GET 不再注册调试连接。
 
+## WebSocket JSON 协议
+
+控制消息和服务端业务消息均使用统一信封：
+
+```ts
+type WebSocketEnvelope<T> = {
+  c: "socket_server";
+  m: string; // 原 type 字段对应的方法名
+  data: T;
+};
+```
+
+客户端示例：
+
+```json
+{"c":"socket_server","m":"join_room","data":{"room_id":"room-1"}}
+```
+
+```json
+{"c":"socket_server","m":"ack","data":{"message_id":"msg-1"}}
+```
+
+服务端业务推送使用 `m: "message"`；协议错误返回 `m: "error"`，错误详情位于 `data.message`。
+
 ## 错误响应
 ```ts
 type ErrorResponse = {

@@ -206,23 +206,25 @@ internal/websocket/grpc_server.go         WebSocket Node gRPC server
 GET /api/ws/route
 ```
 
-连接 WebSocket 后可发送控制消息：
+连接 WebSocket 后，所有 JSON 包统一使用 `c / m / data` 信封，其中 `c` 固定为 `socket_server`，`m` 对应原来的 `type`，具体参数放入 `data`：
 
 ```json
-{"type":"ping"}
+{"c":"socket_server","m":"ping","data":{}}
 ```
 
 ```json
-{"type":"join_room","room_id":"room-1"}
+{"c":"socket_server","m":"join_room","data":{"room_id":"room-1"}}
 ```
 
 ```json
-{"type":"leave_room","room_id":"room-1"}
+{"c":"socket_server","m":"leave_room","data":{"room_id":"room-1"}}
 ```
 
 ```json
-{"type":"ack","message_id":"msg-1"}
+{"c":"socket_server","m":"ack","data":{"message_id":"msg-1"}}
 ```
+
+服务端业务推送使用 `m: "message"`，原有消息字段均位于 `data`；协议错误则返回 `m: "error"`，心跳响应返回 `m: "pong"`。
 
 WebSocket 已包含基础生产增强：
 

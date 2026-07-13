@@ -121,6 +121,18 @@ func TestEndToEndRoutePushAndAck(t *testing.T) {
 	if err := xwebsocket.Message.Receive(client, &raw); err != nil {
 		t.Fatal(err)
 	}
+	var pushedEnvelope struct {
+		C    string          `json:"c"`
+		M    string          `json:"m"`
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(raw), &pushedEnvelope); err != nil {
+		t.Fatal(err)
+	}
+	if pushedEnvelope.C != "socket_server" || pushedEnvelope.M != "message" {
+		t.Fatalf("unexpected pushed envelope: %s", raw)
+	}
+
 	var pushed struct {
 		MessageID string `json:"message_id"`
 		Payload   struct {
@@ -129,7 +141,7 @@ func TestEndToEndRoutePushAndAck(t *testing.T) {
 		AckRequired bool     `json:"ack_required"`
 		ConnIDs     []string `json:"conn_ids"`
 	}
-	if err := json.Unmarshal([]byte(raw), &pushed); err != nil {
+	if err := json.Unmarshal(pushedEnvelope.Data, &pushed); err != nil {
 		t.Fatal(err)
 	}
 	if pushed.MessageID == "" || pushed.Payload.Text != "hello" || !pushed.AckRequired {
@@ -138,7 +150,11 @@ func TestEndToEndRoutePushAndAck(t *testing.T) {
 	if len(pushed.ConnIDs) != 0 || strings.Contains(raw, "conn-e2e") {
 		t.Fatalf("internal route leaked to client: %s", raw)
 	}
-	ackBody, _ := json.Marshal(map[string]string{"type": "ack", "message_id": pushed.MessageID})
+	ackBody, _ := json.Marshal(map[string]any{
+		"c":    "socket_server",
+		"m":    "ack",
+		"data": map[string]string{"message_id": pushed.MessageID},
+	})
 	if err := xwebsocket.Message.Send(client, string(ackBody)); err != nil {
 		t.Fatal(err)
 	}

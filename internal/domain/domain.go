@@ -42,8 +42,22 @@ type Message struct {
 	CreatedAt      int64
 }
 
-// ClientMessage 是发送给 WebSocket 客户端的公开消息结构，不包含内部连接路由。
+const (
+	// ClientChannel 是客户端与服务端 WebSocket JSON 信封的固定协议通道。
+	ClientChannel = "socket_server"
+	// ClientMessageMethod 表示服务端下发业务消息的方法名。
+	ClientMessageMethod = "message"
+)
+
+// ClientMessage 是发送给 WebSocket 客户端的统一信封，不包含内部连接路由。
 type ClientMessage struct {
+	C    string            `json:"c"`
+	M    string            `json:"m"`
+	Data ClientMessageData `json:"data"`
+}
+
+// ClientMessageData 是业务消息公开数据，不包含 ConnIDs 和 DeliveryRoutes。
+type ClientMessageData struct {
 	MessageID   string          `json:"message_id"`
 	FromUserID  string          `json:"from_user_id,omitempty"`
 	ToUserIDs   []string        `json:"to_user_ids,omitempty"`
@@ -55,7 +69,7 @@ type ClientMessage struct {
 	CreatedAt   int64           `json:"created_at"`
 }
 
-// MarshalClientMessage 将内部消息转换为客户端消息，避免暴露 ConnIDs 并避免 []byte 被 Base64 编码。
+// MarshalClientMessage 将内部消息转换为客户端统一信封，避免暴露 ConnIDs 并避免 []byte 被 Base64 编码。
 func MarshalClientMessage(msg *Message) ([]byte, error) {
 	if msg == nil {
 		return nil, nil
@@ -69,15 +83,19 @@ func MarshalClientMessage(msg *Message) ([]byte, error) {
 		payload = encoded
 	}
 	return json.Marshal(ClientMessage{
-		MessageID:   msg.MessageID,
-		FromUserID:  msg.FromUserID,
-		ToUserIDs:   msg.ToUserIDs,
-		GroupID:     msg.GroupID,
-		RoomID:      msg.RoomID,
-		BizType:     msg.BizType,
-		Payload:     payload,
-		AckRequired: msg.AckRequired,
-		CreatedAt:   msg.CreatedAt,
+		C: ClientChannel,
+		M: ClientMessageMethod,
+		Data: ClientMessageData{
+			MessageID:   msg.MessageID,
+			FromUserID:  msg.FromUserID,
+			ToUserIDs:   msg.ToUserIDs,
+			GroupID:     msg.GroupID,
+			RoomID:      msg.RoomID,
+			BizType:     msg.BizType,
+			Payload:     payload,
+			AckRequired: msg.AckRequired,
+			CreatedAt:   msg.CreatedAt,
+		},
 	})
 }
 

@@ -742,12 +742,15 @@ Node ACK 只代表 WebSocket Node 已接收推送任务，并写入本地发送�
 
 ```json
 {
-  "type": "message",
-  "message_id": "msg_100001",
-  "ack_required": true,
-  "content": {
-    "type": "text",
-    "text": "hello"
+  "c": "socket_server",
+  "m": "message",
+  "data": {
+    "message_id": "msg_100001",
+    "ack_required": true,
+    "payload": {
+      "type": "text",
+      "text": "hello"
+    }
   }
 }
 ```
@@ -756,10 +759,11 @@ Node ACK 只代表 WebSocket Node 已接收推送任务，并写入本地发送�
 
 ```json
 {
-  "type": "ack",
-  "message_id": "msg_100001",
-  "ack_type": "received",
-  "client_time": 1720000000
+  "c": "socket_server",
+  "m": "ack",
+  "data": {
+    "message_id": "msg_100001"
+  }
 }
 ```
 
@@ -1040,8 +1044,11 @@ room_888:
 
 ```json
 {
-  "type": "join_room",
-  "room_id": "room_888"
+  "c": "socket_server",
+  "m": "join_room",
+  "data": {
+    "room_id": "room_888"
+  }
 }
 ```
 
