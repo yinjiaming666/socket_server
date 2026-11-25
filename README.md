@@ -2,7 +2,13 @@
 
 本项目是基于 **Golang + Redis + Go Gateway + gRPC** 的分布式 WebSocket 消息分发服务，用于支持多 WebSocket 节点横向扩展、客户端 endpoint 分配、多端登录、ACK、普通消息推送和直播间广播。
 
-> 当前项目保留 Gateway、Message API、WebSocket Node、Redis/gRPC/WebSocket 核心运行链路，并提供基础远程部署脚本。消息下库、离线消息补发、Kafka 超大规模广播按当前需求暂不实现。
+本项目的 Gateway、Message API 和 WebSocket Node 使用 wskit 实现节点分配、长连接、订阅和投递。路由凭证、HTTP 接口和 WebSocket 的 `c / m / data` 消息格式由本项目处理。
+
+## Go 依赖
+
+使用 Go 1.25.0 或以上版本。依赖版本由 `go.mod` 和 `go.sum` 锁定，克隆后运行 `go mod download` 下载依赖。
+
+Go 导入路径为 `github.com/yinjiaming666/wskit`，包名为 `wskit`。Gateway 调用 `CreateGateway`，WebSocket Node 调用 `CreateNode`，Message API 通过 `NewSender` 创建发送器。
 
 ---
 
@@ -17,10 +23,9 @@
 6. 支持同一用户多端登录
 7. 支持 ACK pending / done / failed，并有超时扫描任务
 8. Redis 使用 github.com/redis/go-redis/v9 连接池实现
-9. 支持 Redis EndpointRepository / RouteResolver / AckStore
-10. 支持 Redis Pub/Sub 和 Redis Stream 写入与消费
+9. wskit 使用 Redis 管理节点注册、连接路由和 ACK 状态
+10. 直播间通过 Redis Pub/Sub 广播，公告历史写入 Redis Stream
 11. 支持直播间消息跨节点广播到本机房间连接
-12. 消息下库逻辑预留 MessageStore 接口，当前为空实现
 ```
 
 ---
@@ -62,11 +67,11 @@ Redis ZSET 注册 room_id → endpoint_id 短租约
   ↓
 Message API 查询房间当前承载节点
   ↓
-Redis Pub/Sub 或 Redis Stream 通知按 endpoint_id 精准扇出
+Redis Pub/Sub 通知按 endpoint_id 扇出
   ↓
 目标 WebSocket Node（仅订阅自己的节点频道）
   ↓
-本节点 RoomHub
+wskit 按本地频道订阅推送
   ↓
 房间内 WebSocket 连接
 ```
@@ -77,7 +82,7 @@ Redis Pub/Sub 或 Redis Stream 通知按 endpoint_id 精准扇出
 
 ## 本地运行
 
-单服务接口调试和单元测试可以使用内存实现；Gateway、Message API、WebSocket Node 分进程运行时内存状态互不共享，完整链路联调请使用 Redis 共享状态模式。
+启动 Redis，从 `configs/app.example.json` 复制 `configs/app.json` 并填入实际地址。三个进程使用相同的 Redis 地址、DB 和 `key_prefix`，Gateway 和 Node 使用相同的 `route_token.secret`。Gateway 按 `public_host` 生成 `wss://` 地址，客户端通过配置好的 TLS 代理访问。
 
 ```bash
 CONFIG_FILE=configs/app.json ENDPOINT_ID=gateway-1 go run ./cmd/gateway
@@ -85,15 +90,7 @@ CONFIG_FILE=configs/app.json ENDPOINT_ID=message-api-1 go run ./cmd/message-api
 CONFIG_FILE=configs/app.json ENDPOINT_ID=ws-node-1 go run ./cmd/websocket-node
 ```
 
-共享状态模式由 `configs/app.json` 顶层的 `storage` 字段决定。完整链路联调请配置：
-
-```json
-{
-  "storage": "redis"
-}
-```
-
-本地单进程调试或单元测试可改为 `"storage": "memory"`。
+`storage` 设为 `redis`，省略时也使用 Redis。
 
 ---
 
@@ -185,17 +182,7 @@ deploy/ci-deploy.sh              手工或任意 CI 平台的滚动发布入口
 
 ## gRPC 说明
 
-当前已经接入官方 `google.golang.org/grpc`，并使用 protobuf 消息结构：
-
-```text
-api/proto/websocket/websocket.pb.go       protobuf 消息结构
-api/proto/websocket/websocket_grpc.pb.go  gRPC client/server 接口
-internal/grpcpush/protocol.go             domain 与 protobuf 转换
-internal/push/grpc_client.go              Message API gRPC client
-internal/websocket/grpc_server.go         WebSocket Node gRPC server
-```
-
-说明：当前 pb 文件已和 `api/proto/websocket.proto` 对齐。后续如果调整 proto，需要重新生成或同步更新 pb 文件。
+gRPC 推送协议由 wskit 提供。从旧版升级时，Message API 和 WebSocket Node 需要使用兼容的推送协议。使用同一 Redis 前缀的 Gateway、Message API 和 WebSocket Node 应协调切换。
 
 ---
 
@@ -227,6 +214,8 @@ GET /api/ws/route
 
 服务端业务推送使用 `m: "message"`，原有消息字段均位于 `data`；协议错误则返回 `m: "error"`，心跳响应返回 `m: "pong"`。
 
+客户端通过 WebSocket 发送 `ack`。服务间调用可向承载该连接的 Node 发送 `POST /api/ws-node/ack`，请求体包含 `message_id` 和 `conn_id`。`POST /api/messages/ack` 返回 HTTP 501，`wskit v0.2.0` 的回执登记由 `Session.Ack` 或 `Node.Ack` 提供。
+
 WebSocket 已包含基础生产增强：
 
 ```text
@@ -242,12 +231,12 @@ WebSocket 已包含基础生产增强：
 
 ## 模拟测试客户端
 
-`cmd/simulator` 可以批量获取 Gateway 路由、建立 WebSocket 连接、加入直播间，并周期发送单聊、群聊和直播消息。收到需要 ACK 的消息后会自动回 ACK，结束时输出连接数、收发量和失败数。
+`test/simulator` 可以批量获取 Gateway 路由、建立 WebSocket 连接、加入直播间，并周期发送单聊、群聊和直播消息。收到需要 ACK 的消息后会自动回 ACK，结束时输出连接数、收发量和失败数。
 
 单节点本地测试：
 
 ```bash
-go run ./cmd/simulator \
+go run ./test/simulator \
   -gateway http://127.0.0.1:7000 \
   -message-api http://127.0.0.1:7100 \
   -ws-base ws://127.0.0.1:8081 \
@@ -269,10 +258,10 @@ go run ./cmd/simulator \
 -verbose               输出单条失败日志
 ```
 
-自动端到端测试会覆盖 Gateway 路由、WebSocket 握手、消息推送和客户端 ACK：
+启动本地 Redis 后，可以验证 Gateway 路由、WebSocket 握手、消息推送和客户端 ACK。
 
 ```bash
-go test ./internal/websocket -run TestEndToEndRoutePushAndAck
+WS_TEST_REDIS_ADDR=127.0.0.1:6379 go test -count=1 ./test -run TestEndToEndRoutePushAndAck
 ```
 
 ---
@@ -292,8 +281,9 @@ go test ./internal/websocket -run TestEndToEndRoutePushAndAck
 
 ## 测试
 
+测试文件和模拟器位于 `test/`。设置 `WS_TEST_REDIS_ADDR` 可一并运行 Redis 集成测试。
+
 ```bash
-go mod tidy
 go test ./...
 ```
 
@@ -301,7 +291,5 @@ go test ./...
 
 ## 文档入口
 
-```text
-configs/README.md
-dev.md
-```
+- [部署与运行配置](deploy/QUICK_DEPLOY.md)
+- [旧版设计记录](dev.md)

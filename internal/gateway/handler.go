@@ -4,76 +4,25 @@ import (
 	"context"
 	"net/http"
 	"strings"
+	"time"
+
+	"github.com/yinjiaming666/wskit"
 
 	"socket_server/internal/httpx"
 )
 
-// Handler 提供 Go Gateway 的 HTTP 入口。
-type Handler struct {
-	// selector 表示 endpoint 选择器。
-	selector EndpointSelector
-	// tokenManager 表示路由凭证管理器。
+type handler struct {
+	router       *wskit.Gateway
 	tokenManager *RouteTokenManager
-	// publicHost 表示客户端访问 WebSocket 使用的公开域名。
-	publicHost string
-	// routeTokenTTLSeconds 表示 route_token 有效秒数。
-	routeTokenTTLSeconds int64
-	// readinessCheck 验证 Redis 等关键依赖是否可用。
-	readinessCheck func(context.Context) error
-}
-
-// NewHandler 创建 Go Gateway HTTP 处理器。
-func NewHandler(selector EndpointSelector, tokenManager *RouteTokenManager, publicHost string, routeTokenTTLSeconds int64) *Handler {
-	if publicHost == "" {
-		publicHost = "example.com"
-	}
-	if routeTokenTTLSeconds <= 0 {
-		routeTokenTTLSeconds = 30
-	}
-	return &Handler{selector: selector, tokenManager: tokenManager, publicHost: publicHost, routeTokenTTLSeconds: routeTokenTTLSeconds}
-}
-
-// SetReadinessCheck 设置发布和负载均衡使用的依赖就绪检查。
-func (h *Handler) SetReadinessCheck(check func(context.Context) error) {
-	h.readinessCheck = check
 }
 
 // NewMux 创建 Gateway HTTP 路由。
-func NewMux(handler *Handler) *http.ServeMux {
+func NewMux(router *wskit.Gateway, tokens *RouteTokenManager, ready func(context.Context) error) *http.ServeMux {
+	h := &handler{router: router, tokenManager: tokens}
 	mux := http.NewServeMux()
-	handler.RegisterRoutes(mux)
+	httpx.RegisterProbeRoutes(mux, ready, "gateway dependency unavailable")
+	httpx.HandleMethod(mux, "/api/ws/route", http.MethodGet, h.handleRoute)
 	return mux
-}
-
-// RegisterRoutes 注册 Gateway 路由。
-func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("/healthz", h.HandleHealth)
-	mux.HandleFunc("/readyz", h.HandleReady)
-	mux.HandleFunc("/api/ws/route", h.HandleRoute)
-}
-
-// HandleHealth 返回 Gateway 进程健康状态，供负载均衡和自动发布门禁使用。
-func (h *Handler) HandleHealth(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		httpx.WriteError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	httpx.WriteOK(w, map[string]string{"status": "ok"})
-}
-
-// HandleReady 在关键依赖可用时返回就绪状态。
-func (h *Handler) HandleReady(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		httpx.WriteError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	if h.readinessCheck != nil {
-		if err := h.readinessCheck(r.Context()); err != nil {
-			httpx.WriteError(w, http.StatusServiceUnavailable, "gateway dependency unavailable")
-			return
-		}
-	}
-	httpx.WriteOK(w, map[string]string{"status": "ready"})
 }
 
 // RouteResponse 表示 Gateway 返回给客户端的 WebSocket 路由信息。
@@ -88,37 +37,32 @@ type RouteResponse struct {
 	ExpiresIn int64 `json:"expires_in"`
 }
 
-// HandleRoute 处理客户端获取 WebSocket endpoint 的请求。
-func (h *Handler) HandleRoute(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		httpx.WriteError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-
-	userID := h.resolveUserID(r)
+// handleRoute 处理客户端获取 WebSocket endpoint 的请求。
+func (h *handler) handleRoute(w http.ResponseWriter, r *http.Request) {
+	userID := resolveUserID(r)
 	if userID == "" {
 		httpx.WriteError(w, http.StatusUnauthorized, "user_id is empty")
 		return
 	}
 
-	ep, err := h.selector.SelectEndpoint(r.Context(), userID)
+	route, err := h.router.Route(r.Context(), userID)
 	if err != nil {
 		httpx.WriteError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
 
-	token, err := h.tokenManager.Generate(userID, ep.ID)
+	token, err := h.tokenManager.Generate(userID, route.EndpointID)
 	if err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
-	wsURL := "wss://" + h.publicHost + ep.WSPath + "?route_token=" + token
-	httpx.WriteOK(w, RouteResponse{EndpointID: ep.ID, WSURL: wsURL, RouteToken: token, ExpiresIn: h.routeTokenTTLSeconds})
+	wsURL := route.WSURL + "?route_token=" + token
+	httpx.WriteOK(w, RouteResponse{EndpointID: route.EndpointID, WSURL: wsURL, RouteToken: token, ExpiresIn: int64(h.tokenManager.ttl / time.Second)})
 }
 
 // resolveUserID 从请求中解析用户编号，正式环境应替换为 token 校验结果。
-func (h *Handler) resolveUserID(r *http.Request) string {
+func resolveUserID(r *http.Request) string {
 	userID := r.Header.Get("X-User-ID")
 	if userID != "" {
 		return userID

@@ -1,59 +1,53 @@
 package main
 
 import (
+	"context"
 	"log"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
+
+	"github.com/yinjiaming666/wskit"
 
 	"socket_server/internal/config"
 	"socket_server/internal/gateway"
-	appruntime "socket_server/internal/runtime"
+	"socket_server/internal/host"
 )
 
 // main 启动 Gateway 服务。
 func main() {
-	cfg, err := config.Load("")
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	gatewayConfig, err := selectGatewayConfig(cfg)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	stores := appruntime.NewStores(cfg)
-	defer stores.Close()
-
-	selector := gateway.NewDefaultEndpointSelector(stores.EndpointRepo, stores.RouteResolver, gatewayConfig.HeartbeatTimeout(), gatewayConfig.LastEndpointTTL())
-	tokenManager := gateway.NewRouteTokenManager(cfg.RouteToken.Secret, cfg.RouteTokenTTL())
-	handler := gateway.NewHandler(selector, tokenManager, gatewayConfig.PublicHost, int64(cfg.RouteToken.TTLSeconds))
-	// readiness 同时验证 Redis 共享状态，避免发布门禁只看到进程存活。
-	handler.SetReadinessCheck(stores.Ready)
-
-	mux := gateway.NewMux(handler)
-
-	addr := ":" + strconv.Itoa(gatewayConfig.Port)
-	log.Printf("gateway %s redis=%s storage=%s", gatewayConfig.EndpointID, cfg.Redis.Addr, cfg.Storage)
-	if err := appruntime.ServeHTTP(appruntime.HTTPServerConfig{Addr: addr, Handler: mux, Name: "gateway " + gatewayConfig.EndpointID}); err != nil {
+	if err := run(); err != nil {
 		log.Fatal(err)
 	}
 }
 
-// selectGatewayConfig 根据 ENDPOINT_ID 选择 Gateway 实例配置。
-func selectGatewayConfig(cfg *config.AppConfig) (*config.GatewayConfig, error) {
-	endpointID := os.Getenv("ENDPOINT_ID")
-	if endpointID == "" {
-		gatewayConfig, ok := cfg.DefaultGateway()
-		if !ok {
-			return nil, os.ErrNotExist
-		}
-		return gatewayConfig, nil
+func run() error {
+	cfg, err := config.Load("")
+	if err != nil {
+		return err
 	}
 
-	gatewayConfig, ok := cfg.FindGateway(endpointID)
-	if !ok {
-		return nil, os.ErrNotExist
+	gatewayConfig, err := config.SelectEndpoint("gateway", cfg.Gateways, cfg.FindGateway)
+	if err != nil {
+		return err
 	}
-	return gatewayConfig, nil
+
+	backend := host.NewBackend(cfg.Redis)
+	defer backend.Close()
+	router, err := wskit.CreateGateway(wskit.GatewayConfig{
+		PublicURL:        "wss://" + gatewayConfig.PublicHost,
+		HeartbeatTimeout: gatewayConfig.HeartbeatTimeout(),
+		LastEndpointTTL:  gatewayConfig.LastEndpointTTL(),
+	}, backend)
+	if err != nil {
+		return err
+	}
+	tokenManager := gateway.NewRouteTokenManager(cfg.RouteToken.Secret, cfg.RouteTokenTTL())
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	addr := ":" + strconv.Itoa(gatewayConfig.Port)
+	log.Printf("gateway %s listening on %s", gatewayConfig.EndpointID, addr)
+	return host.ServeHTTP(ctx, addr, gateway.NewMux(router, tokenManager, backend.Ready))
 }

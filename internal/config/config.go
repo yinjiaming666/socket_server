@@ -13,7 +13,7 @@ import (
 
 // AppConfig 表示应用完整配置。
 type AppConfig struct {
-	// Storage 表示共享状态存储模式，可选值为 memory 或 redis。
+	// Storage 表示 wskit 使用的 Redis 共享状态存储。
 	Storage string `json:"storage"`
 	// Redis 表示 Redis 连接配置。
 	Redis RedisConfig `json:"redis"`
@@ -139,7 +139,7 @@ func Load(path string) (*AppConfig, error) {
 // ApplyDefaults 填充配置默认值。
 func (c *AppConfig) ApplyDefaults() {
 	if c.Storage == "" {
-		c.Storage = "memory"
+		c.Storage = "redis"
 	}
 	if c.Redis.Addr == "" {
 		c.Redis.Addr = "127.0.0.1:6379"
@@ -239,8 +239,8 @@ func (c *AppConfig) ApplyEnv() {
 
 // Validate 校验配置是否合法。
 func (c *AppConfig) Validate() error {
-	if c.Storage != "memory" && c.Storage != "redis" {
-		return fmt.Errorf("unsupported storage mode: %s", c.Storage)
+	if c.Storage != "redis" {
+		return fmt.Errorf("unsupported storage mode: %s (wskit requires redis)", c.Storage)
 	}
 	if c.Redis.Addr == "" {
 		return errors.New("redis addr is empty")
@@ -312,6 +312,18 @@ func rememberEndpoint(seen map[string]string, endpointID string, service string)
 	return nil
 }
 
+// SelectEndpoint 根据 ENDPOINT_ID 选择启动实例，未设置时使用第一个实例。
+func SelectEndpoint[T any](service string, instances []T, find func(string) (*T, bool)) (*T, error) {
+	endpointID := os.Getenv("ENDPOINT_ID")
+	if endpointID == "" && len(instances) > 0 {
+		return &instances[0], nil
+	}
+	if instance, ok := find(endpointID); ok {
+		return instance, nil
+	}
+	return nil, fmt.Errorf("%s endpoint %q: %w", service, endpointID, os.ErrNotExist)
+}
+
 // FindGateway 根据 endpoint_id 查找 Gateway 实例配置。
 func (c *AppConfig) FindGateway(endpointID string) (*GatewayConfig, bool) {
 	for index := range c.Gateways {
@@ -322,14 +334,6 @@ func (c *AppConfig) FindGateway(endpointID string) (*GatewayConfig, bool) {
 	return nil, false
 }
 
-// DefaultGateway 返回默认 Gateway 实例配置。
-func (c *AppConfig) DefaultGateway() (*GatewayConfig, bool) {
-	if len(c.Gateways) == 0 {
-		return nil, false
-	}
-	return &c.Gateways[0], true
-}
-
 // FindMessageAPI 根据 endpoint_id 查找 Message API 实例配置。
 func (c *AppConfig) FindMessageAPI(endpointID string) (*MessageAPIConfig, bool) {
 	for index := range c.MessageAPIs {
@@ -338,14 +342,6 @@ func (c *AppConfig) FindMessageAPI(endpointID string) (*MessageAPIConfig, bool) 
 		}
 	}
 	return nil, false
-}
-
-// DefaultMessageAPI 返回默认 Message API 实例配置。
-func (c *AppConfig) DefaultMessageAPI() (*MessageAPIConfig, bool) {
-	if len(c.MessageAPIs) == 0 {
-		return nil, false
-	}
-	return &c.MessageAPIs[0], true
 }
 
 // FindNode 根据 endpoint_id 查找 WebSocket 节点配置。

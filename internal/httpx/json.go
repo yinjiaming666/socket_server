@@ -5,6 +5,16 @@ import (
 	"net/http"
 )
 
+const maxJSONBodyBytes int64 = 1 << 20
+
+// DecodeJSON 解码最多 1 MiB 的请求体并拒绝未知字段。
+func DecodeJSON(w http.ResponseWriter, r *http.Request, target any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	return decoder.Decode(target)
+}
+
 // Response 表示统一 HTTP JSON 响应结构。
 type Response struct {
 	// Code 表示业务状态码，0 表示成功。

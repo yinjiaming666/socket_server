@@ -1,0 +1,44 @@
+package test
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"socket_server/internal/message"
+)
+
+func TestMessageAPIReadyChecksDependenciesWhileHealthStaysLive(t *testing.T) {
+	dependencyErr := errors.New("redis unavailable")
+	// readiness 使用可替换检查器，测试无需构造消息发送依赖。
+	mux := message.NewMux(nil, func(context.Context) error {
+		return dependencyErr
+	})
+
+	assertStatus := func(path string, want int) {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodGet, path, nil)
+		response := httptest.NewRecorder()
+		mux.ServeHTTP(response, request)
+		if response.Code != want {
+			t.Fatalf("%s status = %d, want %d; body=%s", path, response.Code, want, response.Body.String())
+		}
+	}
+
+	assertStatus("/healthz", http.StatusOK)
+	assertStatus("/readyz", http.StatusServiceUnavailable)
+	dependencyErr = nil
+	assertStatus("/readyz", http.StatusOK)
+}
+
+func TestMessageAPIHTTPAckReportsUnavailable(t *testing.T) {
+	mux := message.NewMux(nil, nil)
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/messages/ack", nil))
+	if response.Code != http.StatusNotImplemented || !strings.Contains(response.Body.String(), "/api/ws-node/ack") {
+		t.Fatalf("unexpected ACK response: status=%d body=%s", response.Code, response.Body.String())
+	}
+}

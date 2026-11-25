@@ -38,7 +38,9 @@ JSON 本身不支持注释，配置字段说明统一放在这里。
 
 ### storage
 
-顶层字符串字段。生产及多进程联调使用 `redis`，仅单进程调试或单元测试使用 `memory`；未配置时默认为 `memory`。
+顶层字符串字段。使用 `redis`，省略时也使用 Redis。Gateway、Message API 和 WebSocket Node 使用同一 Redis 地址、DB 和前缀。
+
+首次从内置实现升级到 wskit 时，应协调三个服务切换。同一 Redis 前缀中的旧版推送服务和新版节点使用不同的消息格式。
 
 ### redis
 
