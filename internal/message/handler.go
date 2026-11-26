@@ -23,9 +23,6 @@ func NewMux(service *Service, ready func(context.Context) error) *http.ServeMux 
 	httpx.RegisterProbeRoutes(mux, ready, "message dependency unavailable")
 	httpx.HandleMethod(mux, "/api/messages/single", http.MethodPost, h.handleSingleMessage)
 	httpx.HandleMethod(mux, "/api/messages/group", http.MethodPost, h.handleGroupMessage)
-	httpx.HandleMethod(mux, "/api/messages/ack", http.MethodPost, func(w http.ResponseWriter, _ *http.Request) {
-		httpx.WriteError(w, http.StatusNotImplemented, "send acknowledgment over WebSocket or POST /api/ws-node/ack on the connection's node")
-	})
 	httpx.HandleMethod(mux, "/api/live/rooms/", http.MethodPost, h.handleLiveRoomMessage)
 	return mux
 }

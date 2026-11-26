@@ -5,7 +5,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
 	"socket_server/internal/message"
@@ -32,13 +31,4 @@ func TestMessageAPIReadyChecksDependenciesWhileHealthStaysLive(t *testing.T) {
 	assertStatus("/readyz", http.StatusServiceUnavailable)
 	dependencyErr = nil
 	assertStatus("/readyz", http.StatusOK)
-}
-
-func TestMessageAPIHTTPAckReportsUnavailable(t *testing.T) {
-	mux := message.NewMux(nil, nil)
-	response := httptest.NewRecorder()
-	mux.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/messages/ack", nil))
-	if response.Code != http.StatusNotImplemented || !strings.Contains(response.Body.String(), "/api/ws-node/ack") {
-		t.Fatalf("unexpected ACK response: status=%d body=%s", response.Code, response.Body.String())
-	}
 }

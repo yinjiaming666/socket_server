@@ -467,37 +467,12 @@ TTL 推荐：
 
 ### 7.7 ACK 状态
 
-待 ACK 连接：
+| Redis Key | 类型 | 用途 |
+| --- | --- | --- |
+| `{key_prefix}socket_server:ack:msg:{sha256(message_id)}` | Hash | 以 `conn_id` 为字段保存回执。待确认的值同时绑定节点和用户，终态保存 `done` 或 `failed`。 |
+| `{key_prefix}socket_server:ack:deadlines` | ZSET | 以消息摘要和连接编号为成员，按毫秒到期时间排序。确认或超时后删除对应成员。 |
 
-```text
-ack:msg:{message_id}:pending
-```
-
-类型：Set
-
-已 ACK 连接：
-
-```text
-ack:msg:{message_id}:done
-```
-
-类型：Set
-
-失败连接：
-
-```text
-ack:msg:{message_id}:failed
-```
-
-类型：Set
-
-说明：pending / done / failed 都是临时状态，当前实现保留 24 小时；pending 另有 `ack:pending:index` 用于超时扫描。
-
-TTL 推荐：
-
-```text
-86400 秒
-```
+同一消息的状态在最近更新后保留 24 小时。详情见[回执接口契约](.api/websocket-ack.md)。
 
 ---
 
@@ -767,41 +742,13 @@ Node ACK 只代表 WebSocket Node 已接收推送任务，并写入本地发送�
 }
 ```
 
-WebSocket Node 收到 ACK 后写 Redis：
-
-```text
-SADD ack:msg:{msg_100001}:done conn_1001_ios
-SREM ack:msg:{msg_100001}:pending conn_1001_ios
-```
+WebSocket Node 在消息入队前登记待确认的本地连接。收到 ACK 时，节点根据当前会话的用户和连接查找待确认状态，并在 Redis 中原子更新状态和超时索引。
 
 ---
 
-### 11.4 ACK 超时重试
+### 11.4 ACK 超时
 
-推荐配置：
-
-```text
-ack_timeout = 5s
-max_retry = 2
-ack_redis_ttl = 86400s
-```
-
-流程：
-
-```text
-1. WebSocket Node 将消息写入连接发送队列
-2. 如果 ack_required = true，将 conn_id 写入 pending
-3. 等待客户端 ACK
-4. 超时未 ACK，则重试推送
-5. 超过 max_retry 仍未 ACK，写入 failed
-```
-
-注意：
-
-```text
-当前消息下库逻辑暂时留空，因此 ACK 重试只保证在线连接的短期重试。
-如果后续需要离线消息、消息漫游、长期补发，必须补充消息表和离线消息逻辑。
-```
+回执期限为 30 秒。Message API 每 5 秒扫描 Redis 中的到期记录并将待确认状态更新为 `failed`。迟到回执按 Redis 的时钟判定，终态保持原值。
 
 ---
 
@@ -837,19 +784,13 @@ syntax = "proto3";
 
 package websocket.v1;
 
-option go_package = "app/pb/websocket;websocketpb";
+option go_package = "github.com/yinjiaming666/wskit/api/proto/websocket;websocketpb";
 
 message PushMessage {
   string message_id = 1;
-  string from_user_id = 2;
-  string biz_type = 3; // single / group / live / system
   bytes payload = 4;
-  bool ack_required = 5;
-  int64 created_at = 6;
-  repeated string to_user_ids = 7;
-  repeated string conn_ids = 8;
-  string group_id = 9;
-  string room_id = 10;
+  uint32 frame_type = 11;
+  reserved 2, 3, 5 to 10;
 }
 
 message PushToConnsRequest {
@@ -1766,55 +1707,9 @@ func (r *RedisRouteResolver) GroupConnsByEndpoint(ctx context.Context, connIDs [
 
 ---
 
-## 25. ACK 接口抽象
+## 25. ACK 实现
 
-ACK 逻辑独立管理。
-
-```go
-package ack
-
-import "context"
-
-type AckStore interface {
-    AddPending(ctx context.Context, messageID string, connIDs []string) error
-    MarkDone(ctx context.Context, messageID string, connID string) error
-    MarkFailed(ctx context.Context, messageID string, connID string, reason string) error
-    GetPending(ctx context.Context, messageID string) ([]string, error)
-}
-```
-
-Redis 实现：
-
-```go
-type RedisAckStore struct {
-    redis RedisClient
-}
-
-func (s *RedisAckStore) AddPending(ctx context.Context, messageID string, connIDs []string) error {
-    pendingKey := rediskey.AckPendingKey(messageID)
-
-    if err := s.redis.SAdd(ctx, pendingKey, connIDs...); err != nil {
-        return err
-    }
-
-    return s.redis.Expire(ctx, pendingKey, AckTTL)
-}
-
-func (s *RedisAckStore) MarkDone(ctx context.Context, messageID string, connID string) error {
-    pendingKey := rediskey.AckPendingKey(messageID)
-    doneKey := rediskey.AckDoneKey(messageID)
-
-    if err := s.redis.SRem(ctx, pendingKey, connID); err != nil {
-        return err
-    }
-
-    if err := s.redis.SAdd(ctx, doneKey, connID); err != nil {
-        return err
-    }
-
-    return s.redis.Expire(ctx, doneKey, AckTTL)
-}
-```
+`socket_server/internal/ack` 管理共享 Redis 回执。WebSocket Node 在 `wskit.NodeConfig.BeforePush` 回调中登记状态，在客户端回执和节点 HTTP 回执中更新状态。Message API 运行回执超时任务。
 
 ---
 
@@ -1847,18 +1742,6 @@ func EndpointConnsKey(endpointID string) string {
 
 func LastEndpointKey(userID string) string {
     return fmt.Sprintf("route:last_endpoint:%s", userID)
-}
-
-func AckPendingKey(messageID string) string {
-    return fmt.Sprintf("ack:msg:%s:pending", messageID)
-}
-
-func AckDoneKey(messageID string) string {
-    return fmt.Sprintf("ack:msg:%s:done", messageID)
-}
-
-func AckFailedKey(messageID string) string {
-    return fmt.Sprintf("ack:msg:%s:failed", messageID)
 }
 
 func LiveRoomChannel(roomID string) string {
@@ -1994,7 +1877,7 @@ im-service/
 │   │   └── redis_resolver.go
 │   ├── ack/
 │   │   ├── store.go
-│   │   └── redis_store.go
+│   │   └── worker.go
 │   ├── rediskey/
 │   │   └── keys.go
 │   ├── websocket/
@@ -2120,13 +2003,7 @@ sleep 1
 
 ### 30.3 客户端 ACK 超时
 
-处理方式：
-
-```text
-1. WebSocket Node 本地重试 max_retry 次
-2. 仍未 ACK，写入 ack:msg:{message_id}:failed
-3. 后续消息下库后，可同步写入消息投递状态表
-```
+超过回执期限的连接转为 `failed`。Message API 从 Redis 超时索引中批量处理；节点也会在客户端提交回执时检查期限。
 
 ---
 

@@ -17,6 +17,7 @@ import (
 	"github.com/yinjiaming666/wskit"
 	xwebsocket "golang.org/x/net/websocket"
 
+	"socket_server/internal/ack"
 	"socket_server/internal/config"
 	"socket_server/internal/domain"
 	"socket_server/internal/gateway"
@@ -40,6 +41,8 @@ func TestEndToEndRoutePushAndAck(t *testing.T) {
 	defer sender.Close()
 	notices := message.NewNoticeStore(cfg)
 	defer notices.Close()
+	acks := ack.NewStore(cfg)
+	defer acks.Close()
 
 	redisClient := redis.NewClient(&redis.Options{Addr: redisAddr})
 	defer redisClient.Close()
@@ -65,10 +68,9 @@ func TestEndToEndRoutePushAndAck(t *testing.T) {
 	const wsPath = "/ws/" + nodeID
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	node, err := wskit.CreateNode(wskit.NodeConfig{
+	node, err := wsnode.NewNode(wskit.NodeConfig{
 		EndpointID: nodeID, WSPath: wsPath, GRPCAddr: "127.0.0.1:0",
-		OnMessage: wsnode.HandleClientFrame,
-	}, backend)
+	}, backend, acks)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +101,7 @@ func TestEndToEndRoutePushAndAck(t *testing.T) {
 	}
 
 	tokens := gateway.NewRouteTokenManager("e2e-secret", time.Minute)
-	wsServer := httptest.NewServer(wsnode.NewMux(node, tokens, nodeID, backend.Ready))
+	wsServer := httptest.NewServer(wsnode.NewMux(node, tokens, nodeID, acks, backend.Ready))
 	defer wsServer.Close()
 
 	router, err := wskit.CreateGateway(wskit.GatewayConfig{
@@ -203,8 +205,18 @@ func TestEndToEndRoutePushAndAck(t *testing.T) {
 		return envelope.Data
 	}
 
+	assertReceipt := func(msgID, connectionID, want string) {
+		t.Helper()
+		got, err := acks.State(ctx, msgID, connectionID)
+		if err != nil || got != want {
+			t.Fatalf("receipt for %q on %q = %q, %v; want %q", msgID, connectionID, got, err, want)
+		}
+	}
+
 	sendControl("ping", struct{}{})
 	receive("pong")
+	sendControl("ack", domain.ClientAckData{})
+	receive("error")
 
 	single := post(messageServer, "/api/messages/single", `{"from_user_id":"sender","to_user_id":"receiver","content":{"text":"hello"}}`)
 	var pushed domain.ClientMessageData
@@ -216,15 +228,13 @@ func TestEndToEndRoutePushAndAck(t *testing.T) {
 		string(pushed.Payload) != `{"text":"hello"}` || !pushed.AckRequired {
 		t.Fatalf("unexpected single delivery: %+v, %+v", single, pushed)
 	}
+	assertReceipt(single.MessageID, connID, "pending")
 	sendControl("ack", domain.ClientAckData{MessageID: pushed.MessageID})
 	sendControl("ping", struct{}{})
 	if data := receive("pong"); string(data) != "{}" {
 		t.Fatalf("unexpected pong: %s", data)
 	}
-	got, err := sender.AckedConnections(ctx, single.MessageID)
-	if err != nil || !slices.Equal(got, []string{connID}) {
-		t.Fatalf("WebSocket ACK: got %v, error=%v", got, err)
-	}
+	assertReceipt(single.MessageID, connID, "done")
 
 	group := post(messageServer, "/api/messages/group", `{"message_id":"group-e2e","group_id":"g1","member_user_ids":["receiver","receiver","offline"],"content":"group"}`)
 	if !group.Accepted || !slices.Equal(group.AcceptedConnIDs, []string{connID}) {
@@ -234,11 +244,21 @@ func TestEndToEndRoutePushAndAck(t *testing.T) {
 	if err := json.Unmarshal(receive("message"), &pushed); err != nil || pushed.GroupID != "g1" || pushed.MessageID != group.MessageID {
 		t.Fatalf("group frame: %+v, error=%v", pushed, err)
 	}
-	post(wsServer, "/api/ws-node/ack", `{"message_id":"group-e2e","conn_id":"conn-e2e"}`)
-	got, err = sender.AckedConnections(ctx, group.MessageID)
-	if err != nil || !slices.Equal(got, []string{connID}) {
-		t.Fatalf("Node HTTP ACK: got %v, error=%v", got, err)
+	assertReceipt(group.MessageID, connID, "pending")
+	receipt := post(wsServer, "/api/ws-node/ack", `{"message_id":"group-e2e","conn_id":"conn-e2e"}`)
+	if receipt.Status != "ack" {
+		t.Fatalf("unexpected HTTP receipt response: %+v", receipt)
 	}
+	assertReceipt(group.MessageID, connID, "done")
+
+	post(wsServer, "/api/ws-node/push-conns", `{"conn_ids":["conn-e2e","missing"],"message":{"MessageID":"local-e2e","AckRequired":true}}`)
+	if err := json.Unmarshal(receive("message"), &pushed); err != nil || pushed.MessageID != "local-e2e" || !pushed.AckRequired {
+		t.Fatalf("local push frame: %+v, error=%v", pushed, err)
+	}
+	assertReceipt("local-e2e", connID, "pending")
+	assertReceipt("local-e2e", "missing", "")
+	post(wsServer, "/api/ws-node/ack", `{"message_id":"local-e2e","conn_id":"conn-e2e"}`)
+	assertReceipt("local-e2e", connID, "done")
 
 	sendControl("join_room", domain.ClientRoomData{RoomID: "room-e2e"})
 	sendControl("ping", struct{}{})
@@ -255,6 +275,8 @@ func TestEndToEndRoutePushAndAck(t *testing.T) {
 		pushed.RoomID != "room-e2e" || pushed.MessageID != danmu.MessageID || pushed.AckRequired {
 		t.Fatalf("danmu frame: %+v, error=%v", pushed, err)
 	}
+	assertReceipt(notice.MessageID, connID, "")
+	assertReceipt(danmu.MessageID, connID, "")
 	if !strings.HasPrefix(notice.MessageID, "live-notice-") || !strings.HasPrefix(danmu.MessageID, "live-danmu-") {
 		t.Fatalf("unexpected live message IDs: notice=%q, danmu=%q", notice.MessageID, danmu.MessageID)
 	}

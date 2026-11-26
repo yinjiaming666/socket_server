@@ -20,7 +20,7 @@ func TestHealthEndpointsBeforeNodeRuns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mux := wsnode.NewMux(node, nil, "node-health", func(context.Context) error {
+	mux := wsnode.NewMux(node, nil, "node-health", nil, func(context.Context) error {
 		t.Fatal("unstarted node must fail readiness before checking Redis")
 		return nil
 	})

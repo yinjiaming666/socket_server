@@ -28,6 +28,14 @@ type ClientAckData struct {
 	MessageID string `json:"message_id"`
 }
 
+// ValidateAckMessageID 校验需要确认的消息编号。
+func ValidateAckMessageID(id string) error {
+	if id == "" {
+		return errors.New("message_id is required")
+	}
+	return nil
+}
+
 // DecodeClientEnvelope 严格解析 c / m / data 信封。
 func DecodeClientEnvelope(payload []byte) (*ClientEnvelope, error) {
 	decoder := json.NewDecoder(bytes.NewReader(payload))

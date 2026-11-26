@@ -13,6 +13,7 @@ import (
 
 	"github.com/yinjiaming666/wskit"
 
+	"socket_server/internal/ack"
 	"socket_server/internal/config"
 	"socket_server/internal/gateway"
 	"socket_server/internal/host"
@@ -37,7 +38,9 @@ func run() error {
 
 	backend := host.NewBackend(cfg.Redis)
 	defer backend.Close()
-	node, err := wskit.CreateNode(wskit.NodeConfig{
+	acks := ack.NewStore(cfg.Redis)
+	defer acks.Close()
+	node, err := websocket.NewNode(wskit.NodeConfig{
 		EndpointID:        nodeConfig.EndpointID,
 		WSPath:            nodeConfig.WSPath,
 		WSAddr:            nodeConfig.WSAddr,
@@ -45,13 +48,12 @@ func run() error {
 		MaxConn:           nodeConfig.MaxConn,
 		SendBuffer:        nodeConfig.SendBuffer,
 		HeartbeatInterval: nodeConfig.NodeHeartbeatInterval(),
-		OnMessage:         websocket.HandleClientFrame,
-	}, backend)
+	}, backend, acks)
 	if err != nil {
 		return err
 	}
 	tokenManager := gateway.NewRouteTokenManager(cfg.RouteToken.Secret, cfg.RouteTokenTTL())
-	mux := websocket.NewMux(node, tokenManager, nodeConfig.EndpointID, backend.Ready)
+	mux := websocket.NewMux(node, tokenManager, nodeConfig.EndpointID, acks, backend.Ready)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

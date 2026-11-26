@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/redis/go-redis/v9 v9.6.1
-	github.com/yinjiaming666/wskit v0.2.0
+	github.com/yinjiaming666/wskit v0.3.0
 	golang.org/x/net v0.25.0
 )
 

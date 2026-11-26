@@ -82,6 +82,11 @@ func EncodeMessageFrame(msg *Message) (wskit.Frame, error) {
 	if msg == nil {
 		return wskit.Frame{}, errors.New("message is nil")
 	}
+	if msg.AckRequired {
+		if err := ValidateAckMessageID(msg.MessageID); err != nil {
+			return wskit.Frame{}, err
+		}
+	}
 	body, err := MarshalClientMessage(msg)
 	if err != nil {
 		return wskit.Frame{}, err

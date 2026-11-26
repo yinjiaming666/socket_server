@@ -2,12 +2,12 @@ package websocket
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"strings"
 
 	"github.com/yinjiaming666/wskit"
 
+	"socket_server/internal/ack"
 	"socket_server/internal/domain"
 	"socket_server/internal/gateway"
 	"socket_server/internal/httpx"
@@ -15,14 +15,15 @@ import (
 
 type handler struct {
 	node           *wskit.Node
+	acks           *ack.Store
 	tokenManager   *gateway.RouteTokenManager
 	endpointID     string
 	readinessCheck func(context.Context) error
 }
 
 // NewMux 创建 WebSocket Node 的 HTTP 和 WebSocket 路由。
-func NewMux(node *wskit.Node, tokens *gateway.RouteTokenManager, endpointID string, ready func(context.Context) error) *http.ServeMux {
-	h := &handler{node: node, tokenManager: tokens, endpointID: endpointID, readinessCheck: ready}
+func NewMux(node *wskit.Node, tokens *gateway.RouteTokenManager, endpointID string, acks *ack.Store, ready func(context.Context) error) *http.ServeMux {
+	h := &handler{node: node, tokenManager: tokens, endpointID: endpointID, acks: acks, readinessCheck: ready}
 	mux := http.NewServeMux()
 	httpx.HandleMethod(mux, "/healthz", http.MethodGet, h.handleHealth)
 	httpx.HandleMethod(mux, "/readyz", http.MethodGet, h.handleReady)
@@ -112,58 +113,6 @@ func (h *handler) handleConnect(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-type clientErrorData struct {
-	Message string `json:"message"`
-}
-
-func HandleClientFrame(ctx context.Context, session *wskit.Session, frame wskit.Frame) error {
-	if err := handleClientMessage(ctx, session, frame.Data); err != nil {
-		return sendControl(session, "error", clientErrorData{Message: err.Error()})
-	}
-	return nil
-}
-
-func handleClientMessage(ctx context.Context, session *wskit.Session, payload []byte) error {
-	envelope, err := domain.DecodeClientEnvelope(payload)
-	if err != nil {
-		return err
-	}
-
-	switch envelope.M {
-	case "ack":
-		var data domain.ClientAckData
-		if err := domain.DecodeClientData(envelope.Data, &data); err != nil {
-			return err
-		}
-		return session.Ack(ctx, data.MessageID)
-	case "join_room", "leave_room":
-		var data domain.ClientRoomData
-		if err := domain.DecodeClientData(envelope.Data, &data); err != nil {
-			return err
-		}
-		if envelope.M == "join_room" {
-			return session.Subscribe(ctx, data.RoomID)
-		}
-		return session.Unsubscribe(ctx, data.RoomID)
-	case "ping":
-		var data struct{}
-		if err := domain.DecodeClientData(envelope.Data, &data); err != nil {
-			return err
-		}
-		return sendControl(session, "pong", struct{}{})
-	default:
-		return errors.New("unsupported websocket method")
-	}
-}
-
-func sendControl(session *wskit.Session, method string, data any) error {
-	payload, err := domain.MarshalClientControl(method, data)
-	if err != nil {
-		return err
-	}
-	return session.Send(wskit.Frame{Type: wskit.TextFrame, Data: payload})
-}
-
 func (h *handler) handlePush(byUser bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req PushRequest
@@ -211,8 +160,21 @@ func (h *handler) handleAck(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := h.node.Ack(r.Context(), req.ConnID, req.MessageID); err != nil {
+	if req.ConnID == "" {
+		httpx.WriteError(w, http.StatusBadRequest, "conn_id is required")
+		return
+	}
+	if err := domain.ValidateAckMessageID(req.MessageID); err != nil {
 		httpx.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	userID, ok := h.node.UserIDForConn(req.ConnID)
+	if !ok {
+		httpx.WriteError(w, http.StatusBadRequest, "conn not found")
+		return
+	}
+	if err := h.acks.Confirm(r.Context(), req.MessageID, h.endpointID, req.ConnID, userID); err != nil {
+		httpx.WriteError(w, http.StatusServiceUnavailable, "ack storage unavailable")
 		return
 	}
 	httpx.WriteOK(w, map[string]string{"status": "ack"})

@@ -19,11 +19,11 @@ Go 导入路径为 `github.com/yinjiaming666/wskit`，包名为 `wskit`。Gatewa
 2. WebSocket Node 管理真实 WebSocket 长连接、本地房间连接、客户端 ACK
 3. WebSocket Node 启动内部 gRPC 推送服务
 4. Message API 通过 gRPC 调用目标 WebSocket Node
-5. Message API 提供单聊、群聊、ACK、直播间消息入口
+5. Message API 提供单聊、群聊和直播间消息入口，并扫描回执超时
 6. 支持同一用户多端登录
 7. 支持 ACK pending / done / failed，并有超时扫描任务
 8. Redis 使用 github.com/redis/go-redis/v9 连接池实现
-9. wskit 使用 Redis 管理节点注册、连接路由和 ACK 状态
+9. wskit 使用 Redis 管理节点注册和连接路由，socket_server 管理 ACK 状态
 10. 直播间通过 Redis Pub/Sub 广播，公告历史写入 Redis Stream
 11. 支持直播间消息跨节点广播到本机房间连接
 ```
@@ -214,7 +214,7 @@ GET /api/ws/route
 
 服务端业务推送使用 `m: "message"`，原有消息字段均位于 `data`；协议错误则返回 `m: "error"`，心跳响应返回 `m: "pong"`。
 
-客户端通过 WebSocket 发送 `ack`。服务间调用可向承载该连接的 Node 发送 `POST /api/ws-node/ack`，请求体包含 `message_id` 和 `conn_id`。`POST /api/messages/ack` 返回 HTTP 501，`wskit v0.2.0` 的回执登记由 `Session.Ack` 或 `Node.Ack` 提供。
+单聊和群聊消息带 `ack_required: true`。WebSocket Node 在入队前登记需确认的连接，客户端在收到消息的连接上发送 `ack`。服务间回执使用目标 Node 的 `POST /api/ws-node/ack`，请求体包含 `message_id` 和 `conn_id`。回执期限为 30 秒，Redis 状态保留 24 小时。[回执接口契约](.api/websocket-ack.md)
 
 WebSocket 已包含基础生产增强：
 
